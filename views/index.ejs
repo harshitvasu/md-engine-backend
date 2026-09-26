@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Markdown Source Tree</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #f8f9fa;
+            padding: 2rem;
+            color: #333;
+        }
+        ul {
+            list-style-type: none;
+            padding-left: 20px;
+            border-left: 1px dashed #ccc;
+            margin-left: 10px;
+        }
+        li {
+            margin: 6px 0;
+        }
+        .folder {
+            font-weight: 600;
+            color: #495057;
+        }
+        .file a {
+            text-decoration: none;
+            color: #007bff;
+            transition: color 0.2s;
+        }
+        .file a:hover {
+            color: #0056b3;
+            text-decoration: underline;
+        }
+        .icon {
+            margin-right: 5px;
+        }
+    </style>
+</head>
+<body>
+    <h2>Markdown Source Directory</h2>
+
+    <% function renderTree(tree) { %>
+        <ul>
+        <% tree.forEach(function(node) { %>
+            <% if (node.type === 'directory') { %>
+                <li class="folder">
+                    <span class="icon">📁</span> <%= node.name %>
+                    <% renderTree(node.children) %>
+                </li>
+            <% } else { %>
+                <li class="file">
+                    <span class="icon">📄</span> <a href="/api/md/<%= node.path %>"><%= node.name %></a>
+                </li>
+            <% } %>
+        <% }); %>
+        </ul>
+    <% } %>
+
+    <!-- Trigger the recursive rendering -->
+    <% if (tree && tree.length > 0) { %>
+        <% renderTree(tree) %>
+    <% } else { %>
+        <p>No markdown files found in the /md directory.</p>
+    <% } %>
+</body>
+</html>
