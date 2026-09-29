@@ -21,6 +21,9 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 
+// This allows the frontend to load images via <img src="/images/..." />
+app.use('/images', express.static(path.join(__dirname, 'images')));
+
 // Markdown & Turndown Config
 const md = new MarkdownIt({ html: true });
 const turndownService = new TurndownService({ bulletListMarker: '-', headingStyle: 'atx' });
@@ -302,6 +305,101 @@ app.post('/api/md/update', async (req, res) => {
     }
 });
 
+// POST: Delete a markdown file (and its metadata)
+app.post('/api/delete', async (req, res) => {
+    try {
+        const { path: relativePath } = req.body;
+
+        if (!relativePath) {
+            return res.status(400).json({ success: false, message: 'File path is required.' });
+        }
+
+        const mdDir = path.join(__dirname, 'md');
+        const absolutePath = path.join(mdDir, relativePath);
+
+        // Security check: Prevent directory traversal (e.g., passing "../../system-file")
+        if (!absolutePath.startsWith(mdDir)) {
+            return res.status(403).json({ success: false, message: 'Invalid file path.' });
+        }
+
+        // Check if the file exists
+        try {
+            const stat = await fs.promises.stat(absolutePath);
+            if (stat.isDirectory()) {
+                return res.status(400).json({ success: false, message: 'Cannot delete directories via this endpoint.' });
+            }
+        } catch (err) {
+            return res.status(404).json({ success: false, message: 'File not found.' });
+        }
+
+        // 1. Delete the Markdown file
+        await fs.promises.unlink(absolutePath);
+
+        // 2. Delete the associated metadata file if it exists
+        const metaPath = `${absolutePath}.meta.json`;
+        try {
+            await fs.promises.access(metaPath);
+            await fs.promises.unlink(metaPath);
+        } catch (err) {
+            // Ignore if the meta file doesn't exist, that's fine
+        }
+
+        res.json({ success: true, message: 'File deleted successfully.' });
+    } catch (error) {
+        console.error('Delete error:', error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// POST: Move a markdown file (and its metadata)
+app.post('/api/move', async (req, res) => {
+    try {
+        const { source, destination } = req.body;
+
+        if (!source || destination === undefined) {
+            return res.status(400).json({ success: false, message: 'Source and destination are required.' });
+        }
+
+        const mdDir = path.join(__dirname, 'md');
+        
+        // Resolve absolute source path and extract the file name
+        const absoluteSource = path.join(mdDir, source);
+        const fileName = path.basename(absoluteSource);
+
+        // Resolve absolute destination directory and target file path
+        // (Handle root directory '/' explicitly to prevent trailing slash issues)
+        const destRelative = destination === '/' ? '' : destination;
+        const absoluteDestDir = path.join(mdDir, destRelative);
+        const absoluteDestFile = path.join(absoluteDestDir, fileName);
+
+        // Security check: Ensure both paths stay inside the /md directory
+        if (!absoluteSource.startsWith(mdDir) || !absoluteDestDir.startsWith(mdDir)) {
+            return res.status(403).json({ success: false, message: 'Invalid paths.' });
+        }
+
+        // Ensure the destination directory exists
+        await fs.promises.mkdir(absoluteDestDir, { recursive: true });
+
+        // 1. Move the Markdown file
+        await fs.promises.rename(absoluteSource, absoluteDestFile);
+
+        // 2. Try to move the associated metadata file if it exists
+        const metaSourcePath = `${absoluteSource}.meta.json`;
+        const metaDestPath = `${absoluteDestFile}.meta.json`;
+        try {
+            await fs.promises.access(metaSourcePath);
+            await fs.promises.rename(metaSourcePath, metaDestPath);
+        } catch (err) {
+            // Ignore if the meta file doesn't exist
+        }
+
+        res.json({ success: true, message: 'File moved successfully.' });
+    } catch (error) {
+        console.error('Move error:', error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
 // Helper: Recursively scan directory and fetch metadata for titles
 function getDirectoryTree(dir, basePath = '') {
     const result = [];
@@ -384,6 +482,32 @@ app.post('/api/md/meta', async (req, res) => {
         await fs.promises.writeFile(metaPath, JSON.stringify(meta, null, 2));
         res.json({ success: true, meta });
     } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+
+app.post('/api/upload-drawing', express.json({ limit: '10mb' }), async (req, res) => {
+    try {
+        const { imageBase64 } = req.body;
+        if (!imageBase64) return res.status(400).json({ success: false, message: 'No image data' });
+
+        // Strip the data:image/png;base64, prefix
+        const base64Data = imageBase64.replace(/^data:image\/png;base64,/, "");
+        
+        // Ensure the images directory exists
+        const imagesDir = path.join(__dirname, 'images');
+        await fs.promises.mkdir(imagesDir, { recursive: true });
+
+        // Save as a PNG file
+        const fileName = `draw-${Date.now()}.png`;
+        const filePath = path.join(imagesDir, fileName);
+        await fs.promises.writeFile(filePath, base64Data, 'base64');
+
+        // Return the public URL
+        res.json({ success: true, url: `/images/${fileName}` });
+    } catch (error) {
+        console.error('Image upload error:', error);
         res.status(500).json({ success: false, message: error.message });
     }
 });
