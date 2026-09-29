@@ -16,3 +16,6 @@ Thomas Macaulay’s 1835 Minute on Education fundamentally transformed both the 
 -   **Administrative Utility:** The immediate administrative intent was practical and economic. The British needed a steady supply of English-speaking Indians to staff the lower ranks of the rapidly expanding colonial bureaucracy and judiciary much cheaper than importing British clerks.
     
 -   **Unintended Consequences:** While it successfully created a loyal clerical class—intended to be "Indian in blood and colour, but English in taste"—it inadvertently provided a common _lingua franca_. This enabled leaders from diverse linguistic regions to communicate, absorbing Western concepts of democracy and liberty that ultimately fueled the Indian nationalist movement.
+    
+
+---
