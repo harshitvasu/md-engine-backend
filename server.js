@@ -104,11 +104,61 @@ app.use('/images', express.static(path.join(__dirname, 'images')));
 
 // Markdown & Turndown Config
 const md = new MarkdownIt({ html: true });
-const turndownService = new TurndownService({ bulletListMarker: '-', headingStyle: 'atx' });
+const turndownService = new TurndownService({ 
+    bulletListMarker: '-', 
+    headingStyle: 'atx',
+    codeBlockStyle: 'fenced',
+    fence: '```'
+});
 const tables = turndownPluginGfm.tables;
 turndownService.use(tables);
 turndownService.keep(['div']);
 turndownService.use(gfm);
+
+turndownService.addRule('fencedCodeBlock', {
+    filter: function (node, options) {
+        return options.codeBlockStyle === 'fenced' && node.nodeName === 'PRE';
+    },
+    replacement: function (content, node, options) {
+        const codeElement = node.querySelector ? node.querySelector('code') : null;
+        
+        let targetNode = codeElement || node;
+        let code = '';
+        if (targetNode.ownerDocument && targetNode.querySelector && targetNode.querySelector('br')) {
+            const clone = targetNode.cloneNode(true);
+            const brs = clone.querySelectorAll ? clone.querySelectorAll('br') : [];
+            for (let i = 0; i < brs.length; i++) {
+                const br = brs[i];
+                if (br.parentNode) {
+                    br.parentNode.replaceChild(targetNode.ownerDocument.createTextNode('\n'), br);
+                }
+            }
+            code = clone.textContent || '';
+        } else {
+            code = targetNode.textContent || '';
+        }
+
+        const codeClass = (codeElement && codeElement.getAttribute('class')) || '';
+        const preClass = node.getAttribute('class') || '';
+        const combinedClass = `${codeClass} ${preClass}`.trim();
+        const languageMatch = combinedClass.match(/(?:lang|language)-(\S+)/);
+        const language = languageMatch ? languageMatch[1] : '';
+
+        const fenceChar = (options.fence && options.fence.charAt(0)) || '`';
+        let fenceSize = 3;
+        const fenceInCodeRegex = new RegExp('^' + fenceChar + '{3,}', 'gm');
+        let match;
+        while ((match = fenceInCodeRegex.exec(code))) {
+            if (match[0].length >= fenceSize) {
+                fenceSize = match[0].length + 1;
+            }
+        }
+        const fence = fenceChar.repeat(fenceSize);
+        const cleanCode = code.replace(/\r\n/g, '\n').replace(/\n$/, '');
+
+        return '\n\n' + fence + language + '\n' + cleanCode + '\n' + fence + '\n\n';
+    }
+});
 
 turndownService.addRule('customHeading', {
     filter: ['h1', 'h2'],
