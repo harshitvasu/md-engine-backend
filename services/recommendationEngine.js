@@ -3,6 +3,7 @@ const fs = require('fs-extra');
 const MarkdownIt = require('markdown-it');
 const cheerio = require('cheerio');
 const { getActivityEventsFile } = require('./activityService');
+const { readJsonSafelyAsync } = require('./jsonAtomic');
 
 const md = new MarkdownIt({ html: true });
 
@@ -148,14 +149,7 @@ async function collectUserFileStats(username, options = {}) {
             const totalSections = sections.length;
 
             const metaPath = `${file.absolutePath}.meta.json`;
-            let meta = {};
-            if (await fs.pathExists(metaPath)) {
-                try {
-                    meta = await fs.readJson(metaPath);
-                } catch (e) {
-                    meta = {};
-                }
-            }
+            const meta = await readJsonSafelyAsync(metaPath, {});
 
             // Derive title
             let title = file.relativePath.replace(/\.md$/, '').split('/').pop()

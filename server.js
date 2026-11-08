@@ -19,6 +19,7 @@ const { createGroq } = require('@ai-sdk/groq');
 const { logActivity, getRecentActivities } = require('./services/activityService');
 const { getRecommendations, generateAndPersistRecommendations, collectUserFileStats } = require('./services/recommendationEngine');
 const { enqueueRecalculation, startPeriodicRecalculation } = require('./services/backgroundQueue');
+const { readJsonSafelySync, readJsonSafelyAsync, writeJsonAtomic } = require('./services/jsonAtomic');
 
 // Load environment variables from .env if available (Node 20.6+)
 if (typeof process.loadEnvFile === 'function') {
@@ -369,15 +370,10 @@ function getDirectoryTree(dir, basePath = '') {
                 .join(' ');
             
             const metaPath = `${fullPath}.meta.json`;
-            if (fs.existsSync(metaPath)) {
-                try {
-                    const metaData = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-                    if (metaData._pageMeta && metaData._pageMeta.title) {
-                        fileTitle = metaData._pageMeta.title;
-                    }
-                } catch (e) {
-                    console.error(`Error reading meta for ${item}:`, e);
-                }
+            // Resilient synchronous read that never throws on 0-byte or concurrently updated meta files
+            const metaData = readJsonSafelySync(metaPath, {});
+            if (metaData._pageMeta && metaData._pageMeta.title) {
+                fileTitle = metaData._pageMeta.title;
             }
 
             result.push({ 
@@ -649,7 +645,7 @@ app.post('/api/create-page', authenticate, async (req, res) => {
             }
         };
         try {
-            await fs.promises.writeFile(metaPath, JSON.stringify(initialMeta, null, 2));
+            await writeJsonAtomic(metaPath, initialMeta);
         } catch (err) {
             console.error('Failed to create initial meta file:', err);
         }
@@ -717,18 +713,12 @@ app.get(/^\/api\/md\/(.*)$/, authenticate, async (req, res) => {
             sections.push({ id: generateId(textContent), html: currentSectionHtml });
         }
 
-        // Fetch Metadata
+        // Fetch Metadata safely using atomic resilient helper (handles corrupted/mid-write files)
         const metaPath = `${absolutePath}.meta.json`;
-        let metaData = {};
+        const metaData = readJsonSafelySync(metaPath, {});
         let pageTitle = path.basename(absolutePath).replace(/\.md$/, ''); 
-
-        if (fs.existsSync(metaPath)) {
-            try {
-                metaData = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-                if (metaData._pageMeta?.title) pageTitle = metaData._pageMeta.title;
-            } catch (e) {
-                console.error(`Error reading meta for ${absolutePath}:`, e);
-            }
+        if (metaData._pageMeta?.title) {
+            pageTitle = metaData._pageMeta.title;
         }
 
         // Stitch metadata into sections
@@ -741,13 +731,23 @@ app.get(/^\/api\/md\/(.*)$/, authenticate, async (req, res) => {
         // Track file view timestamp and log activity
         const nowIso = new Date().toISOString();
         if (!metaData._pageMeta) metaData._pageMeta = {};
+
+        // Throttle disk writes for lastViewedAt: only write to disk if > 15s since last recorded view or title missing.
+        // This avoids hammering disk I/O on rapid re-renders or AI tool invocations.
+        const lastViewedMs = metaData._pageMeta.lastViewedAt ? new Date(metaData._pageMeta.lastViewedAt).getTime() : 0;
+        const shouldWriteMeta = !metaData._pageMeta.lastViewedAt || (Date.now() - lastViewedMs > 15000) || !metaData._pageMeta.title;
+
         metaData._pageMeta.lastViewedAt = nowIso;
         if (!metaData._pageMeta.title) metaData._pageMeta.title = pageTitle;
 
-        // Persist view metadata asynchronously
-        fs.promises.writeFile(metaPath, JSON.stringify(metaData, null, 2)).catch(err => {
-            console.error(`Failed to update lastViewedAt for ${absolutePath}:`, err);
-        });
+        if (shouldWriteMeta) {
+            try {
+                // Write atomically via temporary file and rename to prevent 0-byte truncation race conditions
+                await writeJsonAtomic(metaPath, metaData);
+            } catch (err) {
+                console.error(`Failed to update lastViewedAt for ${absolutePath}:`, err);
+            }
+        }
 
         // Log view activity and trigger background recommendation recalculation
         logActivity(req.user.username, {
@@ -904,11 +904,8 @@ app.post('/api/md/meta', authenticate, async (req, res) => {
         }
 
         const metaPath = `${absolutePath}.meta.json`;
-
-        let meta = {};
-        if (fs.existsSync(metaPath)) {
-            meta = JSON.parse(await fs.promises.readFile(metaPath, 'utf8'));
-        }
+        // Asynchronously read existing metadata with corrupted trailing byte recovery
+        let meta = await readJsonSafelyAsync(metaPath, {});
 
         if (pageTitle !== undefined) {
             if (!meta._pageMeta) meta._pageMeta = {};
@@ -934,7 +931,8 @@ app.post('/api/md/meta', authenticate, async (req, res) => {
             meta._pageMeta.lastTrackedAt = nowIso;
         }
 
-        await fs.promises.writeFile(metaPath, JSON.stringify(meta, null, 2));
+        // Serialize write through fileWriteQueues and POSIX atomic rename
+        await writeJsonAtomic(metaPath, meta);
 
         if (eventType) {
             logActivity(req.user.username, {
@@ -1007,14 +1005,8 @@ app.post('/api/recommendations/check', authenticate, async (req, res) => {
         }
 
         const metaPath = `${absolutePath}.meta.json`;
-        let meta = {};
-        if (fs.existsSync(metaPath)) {
-            try {
-                meta = JSON.parse(await fs.promises.readFile(metaPath, 'utf8'));
-            } catch (e) {
-                meta = {};
-            }
-        }
+        // Safely load metadata without throwing if file is being updated concurrently
+        let meta = await readJsonSafelyAsync(metaPath, {});
 
         const nowIso = new Date().toISOString();
         if (!meta._pageMeta) meta._pageMeta = {};
@@ -1036,7 +1028,8 @@ app.post('/api/recommendations/check', authenticate, async (req, res) => {
             }
         }
 
-        await fs.promises.writeFile(metaPath, JSON.stringify(meta, null, 2));
+        // Persist atomically to prevent truncation or interleaving writes
+        await writeJsonAtomic(metaPath, meta);
 
         // Log revision check event
         await logActivity(req.user.username, {
