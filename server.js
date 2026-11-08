@@ -16,6 +16,9 @@ const { createGoogleGenerativeAI } = require('@ai-sdk/google');
 const { createOpenAI } = require('@ai-sdk/openai');
 const { createAnthropic } = require('@ai-sdk/anthropic');
 const { createGroq } = require('@ai-sdk/groq');
+const { logActivity, getRecentActivities } = require('./services/activityService');
+const { getRecommendations, generateAndPersistRecommendations, collectUserFileStats } = require('./services/recommendationEngine');
+const { enqueueRecalculation, startPeriodicRecalculation } = require('./services/backgroundQueue');
 
 // Load environment variables from .env if available (Node 20.6+)
 if (typeof process.loadEnvFile === 'function') {
@@ -29,7 +32,10 @@ if (typeof process.loadEnvFile === 'function') {
 const app = express();
 const port = 4444;
 const JWT_SECRET = process.env.JWT_SECRET || 'md-engine-secure-jwt-secret-key-2026';
-const USERS_FILE = path.join(__dirname, 'data', 'users.json');
+const USERS_FILE = process.env.USERS_FILE || path.join(__dirname, 'data', 'users.json');
+
+// Start periodic recommendation background worker
+startPeriodicRecalculation();
 
 // EJS Configuration
 app.set('view engine', 'ejs');
@@ -183,6 +189,64 @@ turndownService.addRule('customHr', {
     filter: 'hr',
     replacement: () => '\n---\n'
 });
+
+/**
+ * Restores unescaped LaTeX math formulas after Turndown processing.
+ * Turndown automatically escapes backslashes (\ -> \\), underscores (_ -> \_),
+ * brackets ([ -> \[, ] -> \]), asterisks, etc.
+ * This helper restores clean mathematical expressions for both block ($$...$$)
+ * and inline ($...$) formulas.
+ */
+function unescapeMath(markdown) {
+    if (!markdown || typeof markdown !== 'string') return markdown;
+
+    const placeholders = [];
+    const makeToken = (idx) => `@@@MD_CODE_${idx}_${Date.now()}@@@`;
+
+    // Protect fenced code blocks: ```...``` or ~~~...~~~
+    let protectedMd = markdown.replace(/(```[\s\S]*?```|~~~[\s\S]*?~~~)/g, (match) => {
+        const token = makeToken(placeholders.length);
+        placeholders.push({ token, content: match });
+        return token;
+    });
+
+    // Protect inline code blocks: `...`
+    protectedMd = protectedMd.replace(/(`[^`\n]+?`)/g, (match) => {
+        const token = makeToken(placeholders.length);
+        placeholders.push({ token, content: match });
+        return token;
+    });
+
+    const restoreTex = (math) => {
+        return math
+            .replace(/\\\\\\\\/g, '\\\\')
+            .replace(/\\\\([a-zA-Z{}[\]()_#+\-.!*^])/g, '\\$1')
+            .replace(/\\_/g, '_')
+            .replace(/\\\*/g, '*')
+            .replace(/\\\[/g, '[')
+            .replace(/\\\]/g, ']')
+            .replace(/\\\(/g, '(')
+            .replace(/\\\)/g, ')')
+            .replace(/\\~/g, '~')
+            .replace(/\\`/g, '`')
+            .replace(/\\</g, '<')
+            .replace(/\\>/g, '>');
+    };
+
+    // 1. Block math: $$ ... $$
+    let result = protectedMd.replace(/\$\$([\s\S]+?)\$\$/g, (match, math) => `$$${restoreTex(math)}$$`);
+
+    // 2. Inline math: $ ... $ (no whitespace at boundaries, single line)
+    result = result.replace(/\$(?!\s)([^\$\n]+?)(?<!\s)\$/g, (match, math) => `$${restoreTex(math)}$`);
+
+    // Restore protected code blocks in reverse order
+    for (let i = placeholders.length - 1; i >= 0; i--) {
+        const { token, content } = placeholders[i];
+        result = result.replace(token, () => content);
+    }
+
+    return result;
+}
 
 // ---------------------------------------------------------
 // AUTHENTICATION & DIRECTORY HELPERS
@@ -571,6 +635,36 @@ app.post('/api/create-page', authenticate, async (req, res) => {
         await fs.promises.writeFile(filePath, defaultContent);
 
         const relativeFilePath = path.relative(userMd, filePath).replace(/\\/g, '/');
+        const nowIso = new Date().toISOString();
+        const pageTitle = fileName.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+
+        // Initialize companion metadata (.meta.json) with page metadata
+        const metaPath = `${filePath}.meta.json`;
+        const initialMeta = {
+            _pageMeta: {
+                title: pageTitle,
+                createdAt: nowIso,
+                lastViewedAt: nowIso,
+                checkCounter: 0
+            }
+        };
+        try {
+            await fs.promises.writeFile(metaPath, JSON.stringify(initialMeta, null, 2));
+        } catch (err) {
+            console.error('Failed to create initial meta file:', err);
+        }
+
+        // Log file creation event to recent activity stream
+        logActivity(req.user.username, {
+            fileId: relativeFilePath,
+            eventType: 'create_file',
+            timestamp: nowIso,
+            metadata: { title: pageTitle, fileName, location: normalizedLocation }
+        }).catch(err => console.error('Failed to log create activity:', err));
+
+        // Enqueue background recalculation for spaced-repetition recommendations
+        enqueueRecalculation(req.user.username);
+
         res.json({ success: true, filePath: relativeFilePath });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
@@ -606,7 +700,8 @@ app.get(/^\/api\/md\/(.*)$/, authenticate, async (req, res) => {
         
         // Split by <hr> tags
         $('body').contents().each((i, el) => {
-            if (el.tagName === 'hr') {
+            const isHr = el.tagName === 'hr' || el.name === 'hr' || (el.type === 'tag' && el.name === 'hr');
+            if (isHr) {
                 if (currentSectionHtml.trim()) {
                     const textContent = cheerio.load(currentSectionHtml).text();
                     sections.push({ id: generateId(textContent), html: currentSectionHtml });
@@ -643,6 +738,27 @@ app.get(/^\/api\/md\/(.*)$/, authenticate, async (req, res) => {
             count: metaData[sec.id]?.count || 0
         }));
 
+        // Track file view timestamp and log activity
+        const nowIso = new Date().toISOString();
+        if (!metaData._pageMeta) metaData._pageMeta = {};
+        metaData._pageMeta.lastViewedAt = nowIso;
+        if (!metaData._pageMeta.title) metaData._pageMeta.title = pageTitle;
+
+        // Persist view metadata asynchronously
+        fs.promises.writeFile(metaPath, JSON.stringify(metaData, null, 2)).catch(err => {
+            console.error(`Failed to update lastViewedAt for ${absolutePath}:`, err);
+        });
+
+        // Log view activity and trigger background recommendation recalculation
+        logActivity(req.user.username, {
+            fileId: filepath,
+            eventType: 'view_file',
+            timestamp: nowIso,
+            metadata: { title: pageTitle }
+        }).catch(err => console.error('Failed to log view activity:', err));
+
+        enqueueRecalculation(req.user.username);
+
         res.json({ success: true, title: pageTitle, sections: sectionsWithMeta });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
@@ -666,9 +782,19 @@ app.post('/api/md/update', authenticate, async (req, res) => {
 
     try {
         let markdownText = turndownService.turndown(htmlContent);
+        markdownText = unescapeMath(markdownText);
         await fs.ensureDir(path.dirname(absolutePath));
         await fs.writeFile(absolutePath, markdownText, 'utf8');
         
+        // Log content update event to recent activity stream
+        const nowIso = new Date().toISOString();
+        logActivity(req.user.username, {
+            fileId: filePath.replace(/\\/g, '/'),
+            eventType: 'update_file',
+            timestamp: nowIso,
+            metadata: {}
+        }).catch(err => console.error('Failed to log update activity:', err));
+
         res.status(200).json({ success: true, message: 'File updated and saved as Markdown.' });
     } catch (error) {
         res.status(500).json({ success: false, message: 'Failed to update file', error: error.message });
@@ -789,21 +915,158 @@ app.post('/api/md/meta', authenticate, async (req, res) => {
             meta._pageMeta.title = pageTitle;
         }
 
+        const nowIso = new Date().toISOString();
+        let eventType = null;
+
         if (sectionId) {
             if (!meta[sectionId]) meta[sectionId] = { done: false, count: 0 };
-            if (done !== undefined) meta[sectionId].done = done;
-            if (count !== undefined) meta[sectionId].count = count;
+            if (done !== undefined) {
+                meta[sectionId].done = done;
+                eventType = done ? 'track_section' : 'untrack_section';
+            }
+            if (count !== undefined) {
+                meta[sectionId].count = count;
+                if (!eventType) eventType = 'increment_counter';
+            }
+            meta[sectionId].lastTrackedAt = nowIso;
+
+            if (!meta._pageMeta) meta._pageMeta = {};
+            meta._pageMeta.lastTrackedAt = nowIso;
         }
 
         await fs.promises.writeFile(metaPath, JSON.stringify(meta, null, 2));
+
+        if (eventType) {
+            logActivity(req.user.username, {
+                fileId: filePath,
+                sectionId,
+                eventType,
+                timestamp: nowIso,
+                metadata: { done, count }
+            }).catch(err => console.error('Failed to log section activity:', err));
+
+            enqueueRecalculation(req.user.username);
+        }
+
         res.json({ success: true, meta });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }
 });
 
+// ---------------------------------------------------------
+// SPACED-REPETITION RECOMMENDATIONS & ACTIVITY ROUTES
+// ---------------------------------------------------------
+
+// GET /api/recommendations/revision -> Get top 10 revision recommendations for authenticated user
+app.get('/api/recommendations/revision', authenticate, async (req, res) => {
+    try {
+        const result = await getRecommendations(req.user.username);
+        res.json({
+            recommendations: result.recommendations || [],
+            generatedAt: result.generatedAt || new Date().toISOString()
+        });
+    } catch (error) {
+        console.error('Error fetching recommendations:', error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// GET /api/activity/recent -> Get recent activity stream for authenticated user
+app.get('/api/activity/recent', authenticate, async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit, 10) || 50;
+        const activities = await getRecentActivities(req.user.username, limit);
+        res.json({
+            success: true,
+            activities
+        });
+    } catch (error) {
+        console.error('Error fetching recent activities:', error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// POST /api/recommendations/check -> Record a revision check / increment check counter for spaced repetition
+app.post('/api/recommendations/check', authenticate, async (req, res) => {
+    try {
+        const { fileId, sectionId } = req.body;
+        if (!fileId) {
+            return res.status(400).json({ success: false, message: 'fileId is required' });
+        }
+
+        const userMd = getUserMdDir(req.user.username);
+        const absolutePath = path.resolve(path.join(userMd, fileId));
+
+        if (!absolutePath.startsWith(userMd)) {
+            return res.status(403).json({ success: false, message: 'Forbidden' });
+        }
+
+        if (!fs.existsSync(absolutePath)) {
+            return res.status(404).json({ success: false, message: 'File not found' });
+        }
+
+        const metaPath = `${absolutePath}.meta.json`;
+        let meta = {};
+        if (fs.existsSync(metaPath)) {
+            try {
+                meta = JSON.parse(await fs.promises.readFile(metaPath, 'utf8'));
+            } catch (e) {
+                meta = {};
+            }
+        }
+
+        const nowIso = new Date().toISOString();
+        if (!meta._pageMeta) meta._pageMeta = {};
+        meta._pageMeta.checkCounter = (meta._pageMeta.checkCounter || 0) + 1;
+        meta._pageMeta.lastTrackedAt = nowIso;
+
+        let targetSectionId = sectionId || null;
+        if (targetSectionId && meta[targetSectionId]) {
+            meta[targetSectionId].count = (meta[targetSectionId].count || 0) + 1;
+            meta[targetSectionId].lastTrackedAt = nowIso;
+        } else {
+            // If sectionId not specified, update count and lastTrackedAt on all tracked sections
+            for (const key of Object.keys(meta)) {
+                if (key !== '_pageMeta' && meta[key] && meta[key].done) {
+                    meta[key].count = (meta[key].count || 0) + 1;
+                    meta[key].lastTrackedAt = nowIso;
+                    if (!targetSectionId) targetSectionId = key;
+                }
+            }
+        }
+
+        await fs.promises.writeFile(metaPath, JSON.stringify(meta, null, 2));
+
+        // Log revision check event
+        await logActivity(req.user.username, {
+            fileId,
+            sectionId: targetSectionId,
+            eventType: 'revision_check',
+            timestamp: nowIso,
+            metadata: {
+                checkCounter: meta._pageMeta.checkCounter,
+                title: meta._pageMeta.title
+            }
+        });
+
+        // Trigger asynchronous recalculation
+        enqueueRecalculation(req.user.username);
+
+        res.json({
+            success: true,
+            message: 'Revision check recorded successfully',
+            checkCounter: meta._pageMeta.checkCounter,
+            lastTrackedAt: nowIso
+        });
+    } catch (error) {
+        console.error('Error recording revision check:', error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
 // POST /api/upload-drawing -> Upload drawing image (user-scoped)
-app.post('/api/upload-drawing', authenticate, express.json({ limit: '10mb' }), async (req, res) => {
+app.post('/api/upload-drawing', authenticate, async (req, res) => {
     try {
         const { imageBase64 } = req.body;
         if (!imageBase64) return res.status(400).json({ success: false, message: 'No image data' });
@@ -823,7 +1086,7 @@ app.post('/api/upload-drawing', authenticate, express.json({ limit: '10mb' }), a
 });
 
 // POST /api/delete-images -> Delete unneeded user-scoped images (e.g. unsaved drawings/pastes)
-app.post('/api/delete-images', authenticate, express.json(), async (req, res) => {
+app.post('/api/delete-images', authenticate, async (req, res) => {
     try {
         const { fileNames, urls } = req.body;
         const targetFiles = new Set();
@@ -1027,7 +1290,18 @@ Strict output guidelines:
     }
 });
 
-// Start Server
-app.listen(port, () => {
-    console.log(`Backend API running on http://localhost:${port}`);
-});
+// Start Server when executed directly
+if (require.main === module) {
+    app.listen(port, () => {
+        console.log(`Backend API running on http://localhost:${port}`);
+    });
+}
+
+module.exports = {
+    app,
+    JWT_SECRET,
+    USERS_FILE,
+    getUserMdDir,
+    getUserImagesDir,
+    unescapeMath
+};
