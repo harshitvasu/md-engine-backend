@@ -104,6 +104,12 @@ app.use('/images', express.static(path.join(__dirname, 'images')));
 
 // Markdown & Turndown Config
 const md = new MarkdownIt({ html: true });
+
+// NOTE: Use codeBlockStyle: 'fenced' instead of the default 'indented' (4 spaces).
+// In CommonMark / markdown-it, 4-space indentation immediately following a list item
+// (such as a nested 'ul - li - li ul') is treated as continuation of the preceding list item,
+// collapsing the code block into a single-line paragraph (<p>) on save.
+// Using fenced code blocks (```) ensures code blocks remain isolated and intact.
 const turndownService = new TurndownService({ 
     bulletListMarker: '-', 
     headingStyle: 'atx',
@@ -115,6 +121,11 @@ turndownService.use(tables);
 turndownService.keep(['div']);
 turndownService.use(gfm);
 
+// Custom rule for fenced code blocks (<pre> and <pre><code>):
+// 1. Prevents list indentation collisions by guaranteeing fenced code output.
+// 2. Extracts syntax language classes (e.g. language-js, lang-python) from <code> or <pre>.
+// 3. Handles any <br> tags pasted inside code blocks by converting them to clean newlines.
+// 4. Dynamically expands fence length if the code itself contains triple backticks.
 turndownService.addRule('fencedCodeBlock', {
     filter: function (node, options) {
         return options.codeBlockStyle === 'fenced' && node.nodeName === 'PRE';
