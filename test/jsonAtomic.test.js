@@ -45,6 +45,33 @@ describe('Atomic JSON Utilities (services/jsonAtomic.js)', () => {
             assert.equal(result._pageMeta.lastViewedAt, '2026-11-08T19:55:32.969Z');
         });
 
+        it('recovers all sections from spliced premature closing brace corruption (dbms-gemini position 97 bug)', () => {
+            const userCorrupted = `{
+  "_pageMeta": {
+    "lastViewedAt": "2026-11-09T09:55:20.045Z",
+    "title": "dbms-gemini"
+  }
+} "lastViewedAt": "2026-11-09T09:55:19.921Z"
+  },
+  "whatgone3957": {
+    "done": false,
+    "count": 0
+  },
+  "requemas9400": {
+    "done": true,
+    "count": 2
+  }
+}`;
+            const result = parseJsonSafely(userCorrupted);
+            assert.equal(result._pageMeta.title, 'dbms-gemini');
+            assert.equal(result._pageMeta.lastViewedAt, '2026-11-09T09:55:20.045Z');
+            assert.ok(result.whatgone3957, 'Section whatgone3957 must be recovered');
+            assert.equal(result.whatgone3957.done, false);
+            assert.ok(result.requemas9400, 'Section requemas9400 must be recovered');
+            assert.equal(result.requemas9400.done, true);
+            assert.equal(result.requemas9400.count, 2);
+        });
+
         it('returns defaultValue for completely unparseable syntax errors without throwing', () => {
             const invalid = '{ "title": "Incomplete unclosed...';
             const result = parseJsonSafely(invalid, { fallback: true });
@@ -116,6 +143,41 @@ describe('Atomic JSON Utilities (services/jsonAtomic.js)', () => {
             const files = await fs.readdir(TEST_DIR);
             const tempFiles = files.filter(f => f.includes('.tmp.'));
             assert.equal(tempFiles.length, 0);
+        });
+
+        it('rejects invalid inputs that are not serializable objects', async () => {
+            const testFile = path.join(TEST_DIR, 'invalid-test.json');
+            await assert.rejects(async () => {
+                await writeJsonAtomic(testFile, null);
+            }, /Invalid data passed to writeJsonAtomic/);
+
+            await assert.rejects(async () => {
+                await writeJsonAtomic(testFile, undefined);
+            }, /Invalid data passed to writeJsonAtomic/);
+        });
+
+        it('prevents accidental section loss when writing 0-section metadata over existing meta file', async () => {
+            const metaFile = path.join(TEST_DIR, 'sample-topic.md.meta.json');
+            // 1. Initial write with 3 sections
+            await writeJsonAtomic(metaFile, {
+                _pageMeta: { title: 'Sample Topic', lastViewedAt: '2026-11-08T10:00:00.000Z' },
+                sec1: { done: true, count: 5 },
+                sec2: { done: false, count: 0 },
+                sec3: { done: true, count: 1 }
+            });
+
+            // 2. Erroneous / race write passing 0 sections (only _pageMeta)
+            await writeJsonAtomic(metaFile, {
+                _pageMeta: { title: 'Sample Topic', lastViewedAt: '2026-11-09T12:00:00.000Z' }
+            });
+
+            // 3. Verify sections were preserved and not deleted
+            const saved = await readJsonSafelyAsync(metaFile);
+            assert.equal(saved._pageMeta.lastViewedAt, '2026-11-09T12:00:00.000Z');
+            assert.ok(saved.sec1, 'sec1 must be preserved');
+            assert.equal(saved.sec1.count, 5);
+            assert.ok(saved.sec2, 'sec2 must be preserved');
+            assert.ok(saved.sec3, 'sec3 must be preserved');
         });
     });
 });

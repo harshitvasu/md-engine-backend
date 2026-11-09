@@ -742,8 +742,27 @@ app.get(/^\/api\/md\/(.*)$/, authenticate, async (req, res) => {
 
         if (shouldWriteMeta) {
             try {
-                // Write atomically via temporary file and rename to prevent 0-byte truncation race conditions
-                await writeJsonAtomic(metaPath, metaData);
+                // Re-read existing metadata file to ensure we merge lastViewedAt without dropping section keys
+                const existing = await readJsonSafelyAsync(metaPath, null);
+                // Fail-safe: if file exists on disk but failed to read, do NOT overwrite it
+                if (existing === null && fs.existsSync(metaPath)) {
+                    // Skip to protect existing data on disk
+                } else {
+                    const toPersist = existing || metaData;
+                    if (!toPersist._pageMeta) toPersist._pageMeta = {};
+                    toPersist._pageMeta.lastViewedAt = nowIso;
+                    if (!toPersist._pageMeta.title) {
+                        toPersist._pageMeta.title = (metaData._pageMeta && metaData._pageMeta.title) || pageTitle;
+                    }
+                    if (existing?._pageMeta?.lastTrackedAt && !toPersist._pageMeta.lastTrackedAt) {
+                        toPersist._pageMeta.lastTrackedAt = existing._pageMeta.lastTrackedAt;
+                    }
+                    if (existing?._pageMeta?.checkCounter !== undefined && toPersist._pageMeta.checkCounter === undefined) {
+                        toPersist._pageMeta.checkCounter = existing._pageMeta.checkCounter;
+                    }
+                    // Write atomically via temporary file and rename to prevent 0-byte truncation race conditions
+                    await writeJsonAtomic(metaPath, toPersist);
+                }
             } catch (err) {
                 console.error(`Failed to update lastViewedAt for ${absolutePath}:`, err);
             }
