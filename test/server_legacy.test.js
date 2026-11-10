@@ -600,6 +600,40 @@ describe('Legacy Backend Core Suite (server.js)', () => {
             assert.ok(res.data.meta[sectionId].lastTrackedAt);
             assert.ok(res.data.meta._pageMeta.lastTrackedAt);
         });
+
+        it('POST /api/md/meta -> persists section chat history and returns it in GET /api/md/*', async () => {
+            const filePath = 'docs/sections-test.md';
+            const sectionId = 'sec-test-chat';
+            const chatMessages = [
+                { role: 'user', content: 'What is this section about?', timestamp: new Date().toISOString() },
+                { role: 'assistant', content: 'This section explains the core design concepts.', timestamp: new Date().toISOString() }
+            ];
+
+            const metaRes = await makeRequest(app, {
+                method: 'POST',
+                url: '/api/md/meta',
+                headers: authHeader,
+                body: {
+                    filePath,
+                    sectionId,
+                    chat: chatMessages
+                }
+            });
+
+            assert.equal(metaRes.status, 200);
+            assert.equal(metaRes.data.success, true);
+            assert.deepEqual(metaRes.data.meta[sectionId].chat, chatMessages);
+
+            // Verify GET /api/md/* stitches chat messages
+            const getRes = await makeRequest(app, {
+                method: 'GET',
+                url: `/api/md/${filePath}`,
+                headers: authHeader
+            });
+            assert.equal(getRes.status, 200);
+            assert.equal(getRes.data.success, true);
+            assert.ok(Array.isArray(getRes.data.sections));
+        });
     });
 
     // =========================================================================
@@ -644,6 +678,68 @@ describe('Legacy Backend Core Suite (server.js)', () => {
             });
             assert.equal(res.status, 403);
             assert.equal(res.data.success, false);
+        });
+
+        it('POST /api/move -> rejects move if file already exists in destination (409)', async () => {
+            const userMd = getUserMdDir(TEST_USER);
+            const source = 'docs/conflict-file.md';
+            const destination = 'projects';
+
+            const fullSource = path.join(userMd, source);
+            const fullDest = path.join(userMd, destination, 'conflict-file.md');
+
+            await fs.ensureDir(path.dirname(fullSource));
+            await fs.ensureDir(path.dirname(fullDest));
+            await fs.writeFile(fullSource, '# Source File');
+            await fs.writeFile(fullDest, '# Existing Destination File');
+
+            const res = await makeRequest(app, {
+                method: 'POST',
+                url: '/api/move',
+                headers: authHeader,
+                body: { source, destination }
+            });
+
+            assert.equal(res.status, 409);
+            assert.equal(res.data.success, false);
+            assert.match(res.data.message, /already exists/i);
+            assert.match(res.data.message, /cannot move/i);
+
+            // Ensure source file was not deleted/overwritten
+            assert.ok(await fs.pathExists(fullSource), 'Source file should still exist');
+            assert.ok(await fs.pathExists(fullDest), 'Existing destination file should not be modified');
+        });
+
+        it('POST /api/move -> rejects move when source and destination are the same (400)', async () => {
+            const userMd = getUserMdDir(TEST_USER);
+            const source = 'docs/same-dest.md';
+            const fullSource = path.join(userMd, source);
+            await fs.ensureDir(path.dirname(fullSource));
+            await fs.writeFile(fullSource, '# Same Dest');
+
+            const res = await makeRequest(app, {
+                method: 'POST',
+                url: '/api/move',
+                headers: authHeader,
+                body: { source, destination: 'docs' }
+            });
+
+            assert.equal(res.status, 400);
+            assert.equal(res.data.success, false);
+            assert.match(res.data.message, /same/i);
+        });
+
+        it('POST /api/move -> rejects move if source file does not exist (404)', async () => {
+            const res = await makeRequest(app, {
+                method: 'POST',
+                url: '/api/move',
+                headers: authHeader,
+                body: { source: 'docs/non-existent-source.md', destination: 'projects' }
+            });
+
+            assert.equal(res.status, 404);
+            assert.equal(res.data.success, false);
+            assert.match(res.data.message, /not exist/i);
         });
     });
 
@@ -823,6 +919,73 @@ describe('Legacy Backend Core Suite (server.js)', () => {
             assert.equal(res.data.mocked, true);
             assert.ok(res.data.content);
             assert.match(res.data.message, /Missing ANTHROPIC_API_KEY/i);
+        });
+
+        it('POST /api/ai/generate -> handles mode: chat with mock preview response and strict plain text', async () => {
+            delete process.env.ANTHROPIC_API_KEY;
+
+            const res = await makeRequest(app, {
+                method: 'POST',
+                url: '/api/ai/generate',
+                headers: authHeader,
+                body: { 
+                    model: 'claude-3-5-sonnet', 
+                    prompt: 'Summarize this section',
+                    context: '<p>Section content here</p>',
+                    mode: 'chat',
+                    maxWords: 50
+                }
+            });
+
+            assert.equal(res.status, 200);
+            assert.equal(res.data.success, true);
+            assert.equal(res.data.mocked, true);
+            assert.ok(res.data.content);
+            assert.match(res.data.content, /main focus/i);
+            // Verify strict plain text: no HTML tags
+            assert.ok(!/<[a-z][\s\S]*>/i.test(res.data.content), 'Chat response must be strictly plain text without HTML tags');
+        });
+
+        it('POST /api/ai/generate -> handles mode: update and returns rich HTML content', async () => {
+            delete process.env.ANTHROPIC_API_KEY;
+
+            const res = await makeRequest(app, {
+                method: 'POST',
+                url: '/api/ai/generate',
+                headers: authHeader,
+                body: { 
+                    model: 'claude-3-5-sonnet', 
+                    prompt: 'Rewrite as an introduction',
+                    context: '<p>Old content</p>',
+                    mode: 'update'
+                }
+            });
+
+            assert.equal(res.status, 200);
+            assert.equal(res.data.success, true);
+            assert.equal(res.data.mocked, true);
+            assert.ok(res.data.content);
+            // Verify HTML content structure
+            assert.ok(/<[a-z][\s\S]*>/i.test(res.data.content), 'Update mode response should contain HTML markup');
+        });
+
+        it('POST /api/ai/generate -> defaults to GPT OSS 120B (Groq) when model is omitted', async () => {
+            delete process.env.GROQ_API_KEY;
+
+            const res = await makeRequest(app, {
+                method: 'POST',
+                url: '/api/ai/generate',
+                headers: authHeader,
+                body: { 
+                    prompt: 'Explain what this section covers',
+                    mode: 'chat'
+                }
+            });
+
+            assert.equal(res.status, 200);
+            assert.equal(res.data.success, true);
+            assert.equal(res.data.mocked, true);
+            assert.match(res.data.message, /Missing GROQ_API_KEY/i);
         });
     });
 

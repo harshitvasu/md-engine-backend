@@ -725,7 +725,8 @@ app.get(/^\/api\/md\/(.*)$/, authenticate, async (req, res) => {
         const sectionsWithMeta = sections.map(sec => ({
             ...sec,
             done: metaData[sec.id]?.done || false,
-            count: metaData[sec.id]?.count || 0
+            count: metaData[sec.id]?.count || 0,
+            chat: metaData[sec.id]?.chat || metaData[sec.id]?.chatHistory || metaData[sec.id]?.messages || []
         }));
 
         // Track file view timestamp and log activity
@@ -885,6 +886,21 @@ app.post('/api/move', authenticate, async (req, res) => {
             return res.status(403).json({ success: false, message: 'Invalid paths.' });
         }
 
+        if (!fs.existsSync(absoluteSource)) {
+            return res.status(404).json({ success: false, message: 'Source file does not exist.' });
+        }
+
+        if (absoluteSource === absoluteDestFile) {
+            return res.status(400).json({ success: false, message: 'Source and destination are the same.' });
+        }
+
+        if (fs.existsSync(absoluteDestFile)) {
+            return res.status(409).json({
+                success: false,
+                message: `A file named "${fileName}" already exists in the destination folder. Cannot move.`
+            });
+        }
+
         await fs.promises.mkdir(absoluteDestDir, { recursive: true });
         await fs.promises.rename(absoluteSource, absoluteDestFile);
 
@@ -911,10 +927,10 @@ app.get('/api/file-tree', authenticate, (req, res) => {
     res.json({ success: true, tree: fileTree });
 });
 
-// POST /api/md/meta -> Update Metadata (Checkboxes, Counters, Title)
+// POST /api/md/meta -> Update Metadata (Checkboxes, Counters, Title, Section Chat)
 app.post('/api/md/meta', authenticate, async (req, res) => {
     try {
-        const { filePath, sectionId, done, count, pageTitle } = req.body;
+        const { filePath, sectionId, done, count, chat, chatHistory, messages, pageTitle } = req.body;
         const userMd = getUserMdDir(req.user.username);
         const absolutePath = path.resolve(path.join(userMd, filePath));
 
@@ -943,6 +959,10 @@ app.post('/api/md/meta', authenticate, async (req, res) => {
             if (count !== undefined) {
                 meta[sectionId].count = count;
                 if (!eventType) eventType = 'increment_counter';
+            }
+            const incomingChat = chat !== undefined ? chat : (chatHistory !== undefined ? chatHistory : messages);
+            if (incomingChat !== undefined) {
+                meta[sectionId].chat = incomingChat;
             }
             meta[sectionId].lastTrackedAt = nowIso;
 
@@ -1146,11 +1166,35 @@ app.post('/api/delete-images', authenticate, async (req, res) => {
 });
 
 // Helper: Resolve requested model to provider instance & configuration
+// Default model: GPT OSS 120B (Groq)
 function resolveAiModel(requestedModelId) {
-    const rawId = (requestedModelId || 'gemini-3.8-flash').trim();
-    const id = rawId.toLowerCase();
+    let rawId = (requestedModelId || 'openai/gpt-oss-120b').trim();
+    let id = rawId.toLowerCase();
 
-    // 1. Anthropic Claude models
+    // Normalize variations of default GPT OSS 120B
+    if (id === 'gpt oss 120b' || id === 'gpt-oss-120b' || id === 'openai/gpt-oss-120b' || id === 'default') {
+        rawId = 'openai/gpt-oss-120b';
+        id = rawId.toLowerCase();
+    }
+
+    // 1. Groq models (Default: openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.8-27b)
+    if (id.startsWith('qwen') || id.includes('gpt-oss') || id.includes('gpt oss') || id.startsWith('groq/')) {
+        const apiKey = process.env.GROQ_API_KEY;
+        if (!apiKey) {
+            return {
+                error: 'Missing GROQ_API_KEY in backend .env',
+                provider: 'Groq'
+            };
+        }
+        const groq = createGroq({ apiKey });
+        return {
+            provider: 'Groq',
+            modelName: rawId,
+            model: groq(rawId)
+        };
+    }
+
+    // 2. Anthropic Claude models
     if (id.startsWith('claude')) {
         const apiKey = process.env.ANTHROPIC_API_KEY;
         if (!apiKey) {
@@ -1164,23 +1208,6 @@ function resolveAiModel(requestedModelId) {
             provider: 'Anthropic Claude',
             modelName: rawId,
             model: anthropic(rawId)
-        };
-    }
-
-    // 2. Groq models (openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.8-27b)
-    if (id.startsWith('qwen') || id.includes('gpt-oss') || id.startsWith('groq/')) {
-        const apiKey = process.env.GROQ_API_KEY;
-        if (!apiKey) {
-            return {
-                error: 'Missing GROQ_API_KEY in backend .env',
-                provider: 'Groq'
-            };
-        }
-        const groq = createGroq({ apiKey });
-        return {
-            provider: 'Groq',
-            modelName: rawId,
-            model: groq(rawId)
         };
     }
 
@@ -1201,7 +1228,7 @@ function resolveAiModel(requestedModelId) {
         };
     }
 
-    // 4. Google Gemini models (Default)
+    // 4. Google Gemini models
     const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY || process.env.GOOGLE_API_KEY;
     if (!apiKey) {
         return {
@@ -1213,7 +1240,6 @@ function resolveAiModel(requestedModelId) {
     const google = createGoogleGenerativeAI({ apiKey });
     let resolvedGoogleId = rawId;
 
-    // Handle default "gemini-3.8-flash"
     if (id === 'gemini-3.8-flash' || id === 'gemini 3.8 flash' || id === 'gemini') {
         resolvedGoogleId = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
     }
@@ -1226,11 +1252,15 @@ function resolveAiModel(requestedModelId) {
 }
 
 // POST /api/ai/generate -> Extensible AI generation endpoint (Gemini, Claude, OpenAI, Groq)
+// Supports modes:
+// - mode === 'chat': Q&A discussion, returns strict plain text only (maxWords limit)
+// - mode === 'update' (default): Rich text section editing, returns clean valid HTML
 const MOCK_LOREM_IPSUM = `<h2>Generated Section</h2><p>Lorem ipsum dolor sit amet, <strong>consectetur adipiscing elit</strong>. Integer nec odio. Praesent libero. Sed cursus ante dapibus diam. Sed nisi. Nulla quis sem at nibh elementum imperdiet.</p><p>Duis sagittis ipsum. Praesent mauris. Fusce nec tellus sed augue semper porta. Mauris massa. Vestibulum lacinia arcu eget nulla.</p><ul><li>Class aptent taciti sociosqu ad litora torquent per conubia nostra.</li><li>Inceptos himenaeos curabitur sodales ligula in libero.</li></ul>`;
+const MOCK_CHAT_ANSWER = `Based on this section, the main focus is structured organization and key concepts. The content covers essential guidelines and examples to help understand the material effectively. Feel free to ask more specific questions about any part of this section.`;
 
 app.post('/api/ai/generate', authenticate, async (req, res) => {
     try {
-        const { model, prompt, context } = req.body;
+        const { model, prompt, context, mode = 'update', maxWords = 100 } = req.body;
 
         if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
             return res.status(400).json({ success: false, message: 'Prompt is required' });
@@ -1240,19 +1270,41 @@ app.post('/api/ai/generate', authenticate, async (req, res) => {
 
         // If provider API key is not configured, return mock content preview
         if (resolved.error) {
-            console.log(`[AI] ${resolved.error}. Returning mock Lorem Ipsum preview for ${model || 'default'}.`);
-            await new Promise(resolve => setTimeout(resolve, 800));
+            console.log(`[AI] ${resolved.error}. Returning mock preview for ${model || 'default'} (mode: ${mode}).`);
+            await new Promise(resolve => setTimeout(resolve, mode === 'chat' ? 600 : 800));
+            const mockText = mode === 'chat' ? MOCK_CHAT_ANSWER : MOCK_LOREM_IPSUM;
             return res.json({
                 success: true,
-                content: MOCK_LOREM_IPSUM,
+                content: mockText,
+                text: mockText,
                 mocked: true,
                 message: `${resolved.error}. Returned preview content.`
             });
         }
 
-        console.log(`[AI] Generating text with ${resolved.provider} (${resolved.modelName})...`);
+        console.log(`[AI] Generating text with ${resolved.provider} (${resolved.modelName}, mode: ${mode})...`);
 
-        const systemInstruction = `You are an expert content editor assistant inside a rich text editor.
+        let systemInstruction;
+        if (mode === 'chat') {
+            systemInstruction = `You are an AI assistant answering questions about a specific section of a document.
+Context from the document section:
+"""
+${context ? context : '(Empty section)'}
+"""
+
+User question:
+"""
+${prompt.trim()}
+"""
+
+Strict output rules:
+1. Provide a direct, helpful, and concise answer based on the section context.
+2. Return PLAIN TEXT ONLY. Never output any HTML tags (e.g. no <p>, <br>, <div>, <span>, <b>, <i>, <h1>-<h6>).
+3. Do NOT output markdown code fences (no \`\`\` or \`\`\`html).
+4. Strictly limit your answer to at most ${maxWords} words (aim for between 50 and ${maxWords} words). Do not exceed ${maxWords} words.`;
+        } else {
+            // mode === 'update' (default): Rich text editor HTML replacement
+            systemInstruction = `You are an expert content editor assistant inside a rich text editor.
 The user wants you to edit, rewrite, expand, or generate content for a section of their document.
 
 Current section content (HTML):
@@ -1266,14 +1318,47 @@ Strict output guidelines:
 2. Do NOT wrap the output in markdown code blocks (\`\`\`html or \`\`\`). Output raw HTML directly.
 3. Preserve existing facts, style, and context unless the prompt requests changing or replacing them.
 4. Keep the HTML semantic without inline CSS styles, script tags, or wrapper divs.`;
+        }
 
         const result = await generateText({
             model: resolved.model,
             prompt: systemInstruction
         });
 
-        let outputHtml = (result.text || '').trim();
+        let rawText = (result.text || '').trim();
 
+        if (mode === 'chat') {
+            // 1. Strip markdown code fences if present
+            if (rawText.startsWith('```')) {
+                rawText = rawText.replace(/^```[a-z]*\s*\n?/, '').replace(/\n?```\s*$/, '').trim();
+            }
+
+            // 2. Strict guarantee: strip any HTML tags if AI generated them
+            let plainText = cheerio.load(rawText).text().trim();
+            if (!plainText) {
+                plainText = rawText.replace(/<[^>]+>/g, '').trim();
+            }
+
+            // 3. Word limit enforcement: cap at maxWords
+            const words = plainText.split(/\s+/).filter(Boolean);
+            let finalText = plainText;
+            if (words.length > maxWords) {
+                finalText = words.slice(0, maxWords).join(' ') + '...';
+            }
+
+            return res.json({
+                success: true,
+                text: finalText,
+                content: finalText,
+                wordCount: finalText.split(/\s+/).filter(Boolean).length,
+                mocked: false,
+                model: resolved.modelName,
+                provider: resolved.provider
+            });
+        }
+
+        // mode === 'update': Format as valid HTML
+        let outputHtml = rawText;
         // Strip markdown code fences if model enclosed it in ```html ... ```
         if (outputHtml.startsWith('```')) {
             outputHtml = outputHtml.replace(/^```(?:html)?\s*\n?/, '').replace(/\n?```\s*$/, '').trim();
