@@ -317,35 +317,6 @@ function generateId(text) {
     return (firstFour + lastFour + text.length).toLowerCase();
 }
 
-function bundleContentForReact(htmlString) {
-    const $ = cheerio.load(htmlString, null, false);
-    const sections = [];
-    let $currentBox = $('<div class="read-content"></div>');
-
-    $.root().contents().each((index, element) => {
-        if (element.type === 'tag' && element.name === 'hr') {
-            if ($currentBox.contents().length > 0) {
-                const boxText = $currentBox.text().trim();
-                const boxId = generateId(boxText);
-                $currentBox.attr('id', boxId);
-                sections.push({ id: boxId, html: $.html($currentBox) });
-            }
-            $currentBox = $('<div class="read-content"></div>');
-        } else {
-            $currentBox.append(element);
-        }
-    });
-
-    if ($currentBox.contents().length > 0) {
-        const boxText = $currentBox.text().trim();
-        const boxId = generateId(boxText);
-        $currentBox.attr('id', boxId);
-        sections.push({ id: boxId, html: $.html($currentBox) });
-    }
-    
-    return sections;
-}
-
 function getDirectoryTree(dir, basePath = '') {
     const result = [];
     if (!fs.existsSync(dir)) return result;
