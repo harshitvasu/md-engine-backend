@@ -17,7 +17,7 @@ const { createOpenAI } = require('@ai-sdk/openai');
 const { createAnthropic } = require('@ai-sdk/anthropic');
 const { createGroq } = require('@ai-sdk/groq');
 const { logActivity, getRecentActivities } = require('./services/activityService');
-const { getRecommendations, generateAndPersistRecommendations, collectUserFileStats } = require('./services/recommendationEngine');
+const { getRecommendations, generateAndPersistRecommendations, collectUserFileStats, isHeadingOnlySection } = require('./services/recommendationEngine');
 const { enqueueRecalculation, startPeriodicRecalculation } = require('./services/backgroundQueue');
 const { readJsonSafelySync, readJsonSafelyAsync, writeJsonAtomic } = require('./services/jsonAtomic');
 
@@ -1371,5 +1371,6 @@ module.exports = {
     USERS_FILE,
     getUserMdDir,
     getUserImagesDir,
-    unescapeMath
+    unescapeMath,
+    isHeadingOnlySection
 };

@@ -41,6 +41,48 @@ function parseSections(rawMarkdown) {
     return sections;
 }
 
+/**
+ * Detects whether a section HTML qualifies as a single-heading-only section.
+ * Mirrors the frontend isHeadingOnlySection definition:
+ * - Must contain exactly 1 heading: single H1, H2, H3, or H4.
+ * - Heading text must be non-empty.
+ * - No substantive body text or media/blocks (img, svg, canvas, iframe, table, video, audio, pre)
+ *   outside of that single heading.
+ *
+ * Such sections have their checkboxes hidden in the UI and are excluded
+ * when calculating total percentage and recommendation coverage.
+ */
+function isHeadingOnlySection(htmlString) {
+    if (!htmlString || typeof htmlString !== 'string') return false;
+
+    const $ = cheerio.load(htmlString);
+    const body = $('body');
+    if (!body || body.length === 0) return false;
+
+    // Find all headings: must be exactly 1 heading in total
+    const allHeadings = body.find('h1, h2, h3, h4, h5, h6');
+    if (allHeadings.length !== 1) return false;
+
+    // That single heading must specifically be one of H1, H2, H3, or H4
+    const singleHeading = allHeadings.first();
+    const tagName = (singleHeading.prop('tagName') || singleHeading.get(0)?.tagName || '').toLowerCase();
+    if (!['h1', 'h2', 'h3', 'h4'].includes(tagName)) return false;
+
+    // The heading must contain non-empty text
+    const headingText = (singleHeading.text() || '').trim();
+    if (headingText.length === 0) return false;
+
+    // Clone body to examine content outside of that single heading
+    const clone = cheerio.load(body.html() || '');
+    clone('h1, h2, h3, h4, h5, h6').remove();
+
+    // Check for remaining non-whitespace text or substantive media/blocks outside the heading
+    const remainingText = (clone.text() || '').replace(/\u00a0/g, ' ').trim();
+    const hasRemainingMedia = clone('img, svg, canvas, iframe, table, video, audio, pre').length > 0;
+
+    return remainingText.length === 0 && !hasRemainingMedia;
+}
+
 function getUserMdDir(username) {
     if (!username) throw new Error('Username required');
     const safeUser = username.replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase();
@@ -146,7 +188,11 @@ async function collectUserFileStats(username, options = {}) {
         try {
             const content = await fs.readFile(file.absolutePath, 'utf8');
             const sections = parseSections(content);
-            const totalSections = sections.length;
+
+            // Filter out sections that are heading-only (e.g. single H1-H4 with no body content)
+            // as these sections do not have completion checkboxes and must be ignored for total percentage.
+            const trackableSections = sections.filter(sec => !isHeadingOnlySection(sec.html));
+            const totalSections = trackableSections.length;
 
             const metaPath = `${file.absolutePath}.meta.json`;
             const meta = await readJsonSafelyAsync(metaPath, {});
@@ -160,11 +206,11 @@ async function collectUserFileStats(username, options = {}) {
                 title = meta._pageMeta.title;
             }
 
-            // Calculate tracked sections & latest timestamps
+            // Calculate tracked sections & latest timestamps among trackable sections
             let trackedSections = 0;
             let latestSectionTrackedTime = 0;
 
-            for (const sec of sections) {
+            for (const sec of trackableSections) {
                 const secMeta = meta[sec.id] || {};
                 const isDone = secMeta.done === true;
                 if (isDone) {
@@ -173,6 +219,15 @@ async function collectUserFileStats(username, options = {}) {
                         const t = new Date(secMeta.lastTrackedAt).getTime();
                         if (t > latestSectionTrackedTime) latestSectionTrackedTime = t;
                     }
+                }
+            }
+
+            // Also check all sections for latestSectionTrackedTime
+            for (const sec of sections) {
+                const secMeta = meta[sec.id] || {};
+                if (secMeta.lastTrackedAt) {
+                    const t = new Date(secMeta.lastTrackedAt).getTime();
+                    if (t > latestSectionTrackedTime) latestSectionTrackedTime = t;
                 }
             }
 
@@ -230,6 +285,7 @@ async function collectUserFileStats(username, options = {}) {
                 userId: username,
                 title,
                 totalSections,
+                rawTotalSections: sections.length,
                 trackedSections,
                 coveragePercentage: Math.round(coveragePercentage * 100) / 100,
                 daysSinceLastCheck: Math.round(daysSinceLastCheck * 10) / 10,
@@ -322,6 +378,8 @@ function rankRecommendations(fileStats, options = {}) {
         fileId: file.fileId,
         title: file.title,
         coveragePercentage: file.coveragePercentage,
+        totalSections: file.totalSections,
+        trackedSections: file.trackedSections,
         checkCounter: file.checkCounter || 0,
         lastTrackedAt: file.lastTrackedAt,
         lastViewedAt: file.lastViewedAt,
@@ -384,6 +442,7 @@ async function getRecommendations(username, options = {}) {
 module.exports = {
     generateId,
     parseSections,
+    isHeadingOnlySection,
     findMarkdownFiles,
     collectUserFileStats,
     calculateRecommendationScore,

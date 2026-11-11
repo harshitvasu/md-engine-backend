@@ -5,6 +5,7 @@ const fs = require('fs-extra');
 
 const {
     parseSections,
+    isHeadingOnlySection,
     calculateRecommendationScore,
     rankRecommendations,
     collectUserFileStats,
@@ -450,6 +451,92 @@ describe('Spaced-Repetition Recommendation Engine', () => {
         assert.equal(due.score, 85);
         assert.equal(due.details.coveragePercentage, 75);
         assert.equal(due.details.recencyBonus, 10);
+    });
+
+    // 13. isHeadingOnlySection detection
+    it('13. correctly detects isHeadingOnlySection for single H1-H4 headings without body content', () => {
+        // Single H1-H4 headings qualify
+        assert.equal(isHeadingOnlySection('<h1>Document Title</h1>'), true);
+        assert.equal(isHeadingOnlySection('<h2>Section Heading</h2>'), true);
+        assert.equal(isHeadingOnlySection('<h3>Subheading</h3>'), true);
+        assert.equal(isHeadingOnlySection('<h4>Minor Heading</h4>'), true);
+        assert.equal(isHeadingOnlySection('<h3>Heading</h3><p>  </p>'), true, 'Tolerates empty whitespace paragraphs');
+
+        // Other headings or content do not qualify
+        assert.equal(isHeadingOnlySection('<h5>Heading 5</h5>'), false, 'H5 does not qualify');
+        assert.equal(isHeadingOnlySection('<h6>Heading 6</h6>'), false, 'H6 does not qualify');
+        assert.equal(isHeadingOnlySection('<h1>Title</h1><p>Body paragraph content</p>'), false, 'Headings with body text do not qualify');
+        assert.equal(isHeadingOnlySection('<h1>Title</h1><img src="diagram.png">'), false, 'Headings with images do not qualify');
+        assert.equal(isHeadingOnlySection('<h1>Title 1</h1><h2>Title 2</h2>'), false, 'Multiple headings do not qualify');
+        assert.equal(isHeadingOnlySection('<p>Just regular text</p>'), false, 'Plain paragraphs do not qualify');
+        assert.equal(isHeadingOnlySection(''), false, 'Empty string does not qualify');
+        assert.equal(isHeadingOnlySection(null), false, 'Null does not qualify');
+    });
+
+    // 14. Ignore isHeadingOnlySection in collectUserFileStats totalSections and coverage %
+    it('14. ignores isHeadingOnlySection when calculating totalSections and coverage percentage in collectUserFileStats', async () => {
+        const user1Md = path.join(USER1_DIR, 'md');
+        await fs.ensureDir(user1Md);
+
+        const filePath = path.join(user1Md, 'heading-filter-doc.md');
+        const metaPath = `${filePath}.meta.json`;
+
+        // 3 sections:
+        // Section 1: Heading-only title (# System Architecture Overview)
+        // Section 2: Content section (## Database\nPostgreSQL cluster setup details)
+        // Section 3: Content section (## Cache\nRedis cluster setup details)
+        const docMarkdown = '# System Architecture Overview\n\n---\n\n## Database\nPostgreSQL cluster setup details\n\n---\n\n## Cache\nRedis cluster setup details';
+        await fs.writeFile(filePath, docMarkdown);
+
+        const parsed = parseSections(docMarkdown);
+        assert.equal(parsed.length, 3, 'Should parse 3 total sections');
+        assert.equal(isHeadingOnlySection(parsed[0].html), true, 'Section 1 should be heading-only');
+        assert.equal(isHeadingOnlySection(parsed[1].html), false, 'Section 2 should not be heading-only');
+        assert.equal(isHeadingOnlySection(parsed[2].html), false, 'Section 3 should not be heading-only');
+
+        // User tracks both actionable content sections (2 out of 2 trackable sections = 100%)
+        const nowIso = new Date().toISOString();
+        const meta = {
+            _pageMeta: { title: 'System Architecture', lastViewedAt: nowIso },
+            [parsed[1].id]: { done: true, count: 1, lastTrackedAt: nowIso },
+            [parsed[2].id]: { done: true, count: 1, lastTrackedAt: nowIso }
+        };
+        await fs.writeJson(metaPath, meta);
+
+        const stats = await collectUserFileStats(TEST_USER_1);
+        const fileStat = stats.find(s => s.fileId === 'heading-filter-doc.md');
+
+        assert.ok(fileStat, 'File stat must exist');
+        // totalSections must ignore heading-only section: 2 trackable sections instead of 3
+        assert.equal(fileStat.totalSections, 2, 'Total trackable sections should be 2 (ignoring heading-only section)');
+        assert.equal(fileStat.rawTotalSections, 3, 'Raw total sections should preserve total 3 sections');
+        assert.equal(fileStat.trackedSections, 2, 'Tracked sections should be 2');
+        assert.equal(fileStat.coveragePercentage, 100, 'Coverage should be 100% (2/2) instead of 66.7% (2/3)');
+    });
+
+    // 15. Exclude files that have only heading-only sections from recommendations
+    it('15. excludes files that have only heading-only sections from eligible recommendations', async () => {
+        const user1Md = path.join(USER1_DIR, 'md');
+        await fs.ensureDir(user1Md);
+
+        const filePath = path.join(user1Md, 'only-heading.md');
+        const metaPath = `${filePath}.meta.json`;
+
+        await fs.writeFile(filePath, '# Empty Page Title');
+        const nowIso = new Date().toISOString();
+        await fs.writeJson(metaPath, {
+            _pageMeta: { title: 'Empty Page', lastViewedAt: nowIso }
+        });
+
+        const stats = await collectUserFileStats(TEST_USER_1);
+        const stat = stats.find(s => s.fileId === 'only-heading.md');
+        assert.ok(stat);
+        assert.equal(stat.totalSections, 0, 'Total trackable sections should be 0');
+        assert.equal(stat.coveragePercentage, 0);
+
+        const { recommendations } = await getRecommendations(TEST_USER_1);
+        const found = recommendations.find(r => r.fileId === 'only-heading.md');
+        assert.equal(found, undefined, 'File with only heading sections must not be eligible for recommendation');
     });
 
 });
