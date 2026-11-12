@@ -5,21 +5,51 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const cookieParser = require('cookie-parser');
 const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
-const MarkdownIt = require('markdown-it');
-const cheerio = require('cheerio');
-const TurndownService = require('turndown');
-const { gfm } = require('turndown-plugin-gfm');
-const turndownPluginGfm = require('turndown-plugin-gfm');
-const { generateText } = require('ai');
-const { createGoogleGenerativeAI } = require('@ai-sdk/google');
-const { createOpenAI } = require('@ai-sdk/openai');
-const { createAnthropic } = require('@ai-sdk/anthropic');
-const { createGroq } = require('@ai-sdk/groq');
+
+// Internal Services
 const { logActivity, getRecentActivities } = require('./services/activityService');
-const { getRecommendations, generateAndPersistRecommendations, collectUserFileStats, isHeadingOnlySection } = require('./services/recommendationEngine');
-const { enqueueRecalculation, startPeriodicRecalculation } = require('./services/backgroundQueue');
-const { readJsonSafelySync, readJsonSafelyAsync, writeJsonAtomic } = require('./services/jsonAtomic');
+const { getRecommendations } = require('./services/recommendationEngine');
+const { enqueueRecalculation, ensureWorkerRunning } = require('./services/backgroundQueue');
+const { readJsonSafelySync, writeJsonAtomic } = require('./services/jsonAtomic');
+
+// Helper Modules
+const { 
+    JWT_SECRET, 
+    USERS_FILE, 
+    loadUsers, 
+    saveUsers, 
+    authenticate, 
+    setAuthCookie, 
+    clearAuthCookie, 
+    issueToken,
+    hashPassword,
+    comparePassword 
+} = require('./helpers/authHelper');
+
+const {
+    getUserMdDir,
+    getUserImagesDir,
+    getDirectoryTree,
+    getDirectories,
+    extractImageFileNames
+} = require('./helpers/fileHelper');
+
+const {
+    unescapeMath,
+    parseSections,
+    htmlToMarkdown
+} = require('./helpers/markdownHelper');
+
+const {
+    recordFileView,
+    updateSectionMetadata,
+    recordRevisionCheck
+} = require('./helpers/metadataHelper');
+
+const {
+    generateAiContent,
+    MOCK_LOREM_IPSUM
+} = require('./helpers/aiHelper');
 
 // Load environment variables from .env if available (Node 20.6+)
 if (typeof process.loadEnvFile === 'function') {
@@ -32,11 +62,9 @@ if (typeof process.loadEnvFile === 'function') {
 
 const app = express();
 const port = 4444;
-const JWT_SECRET = process.env.JWT_SECRET || 'md-engine-secure-jwt-secret-key-2026';
-const USERS_FILE = process.env.USERS_FILE || path.join(__dirname, 'data', 'users.json');
 
-// Start periodic recommendation background worker
-startPeriodicRecalculation();
+// Ensure standalone recommendation background worker is running
+ensureWorkerRunning();
 
 // EJS Configuration
 app.set('view engine', 'ejs');
@@ -109,272 +137,6 @@ app.get('/images/:fileName', (req, res) => {
 // Fallback static handler
 app.use('/images', express.static(path.join(__dirname, 'images')));
 
-// Markdown & Turndown Config
-const md = new MarkdownIt({ html: true });
-
-// NOTE: Use codeBlockStyle: 'fenced' instead of the default 'indented' (4 spaces).
-// In CommonMark / markdown-it, 4-space indentation immediately following a list item
-// (such as a nested 'ul - li - li ul') is treated as continuation of the preceding list item,
-// collapsing the code block into a single-line paragraph (<p>) on save.
-// Using fenced code blocks (```) ensures code blocks remain isolated and intact.
-const turndownService = new TurndownService({ 
-    bulletListMarker: '-', 
-    headingStyle: 'atx',
-    codeBlockStyle: 'fenced',
-    fence: '```'
-});
-const tables = turndownPluginGfm.tables;
-turndownService.use(tables);
-turndownService.keep(['div']);
-turndownService.use(gfm);
-
-// Custom rule for fenced code blocks (<pre> and <pre><code>):
-// 1. Prevents list indentation collisions by guaranteeing fenced code output.
-// 2. Extracts syntax language classes (e.g. language-js, lang-python) from <code> or <pre>.
-// 3. Handles any <br> tags pasted inside code blocks by converting them to clean newlines.
-// 4. Dynamically expands fence length if the code itself contains triple backticks.
-turndownService.addRule('fencedCodeBlock', {
-    filter: function (node, options) {
-        return options.codeBlockStyle === 'fenced' && node.nodeName === 'PRE';
-    },
-    replacement: function (content, node, options) {
-        const codeElement = node.querySelector ? node.querySelector('code') : null;
-        
-        let targetNode = codeElement || node;
-        let code = '';
-        if (targetNode.ownerDocument && targetNode.querySelector && targetNode.querySelector('br')) {
-            const clone = targetNode.cloneNode(true);
-            const brs = clone.querySelectorAll ? clone.querySelectorAll('br') : [];
-            for (let i = 0; i < brs.length; i++) {
-                const br = brs[i];
-                if (br.parentNode) {
-                    br.parentNode.replaceChild(targetNode.ownerDocument.createTextNode('\n'), br);
-                }
-            }
-            code = clone.textContent || '';
-        } else {
-            code = targetNode.textContent || '';
-        }
-
-        const codeClass = (codeElement && codeElement.getAttribute('class')) || '';
-        const preClass = node.getAttribute('class') || '';
-        const combinedClass = `${codeClass} ${preClass}`.trim();
-        const languageMatch = combinedClass.match(/(?:lang|language)-(\S+)/);
-        const language = languageMatch ? languageMatch[1] : '';
-
-        const fenceChar = (options.fence && options.fence.charAt(0)) || '`';
-        let fenceSize = 3;
-        const fenceInCodeRegex = new RegExp('^' + fenceChar + '{3,}', 'gm');
-        let match;
-        while ((match = fenceInCodeRegex.exec(code))) {
-            if (match[0].length >= fenceSize) {
-                fenceSize = match[0].length + 1;
-            }
-        }
-        const fence = fenceChar.repeat(fenceSize);
-        const cleanCode = code.replace(/\r\n/g, '\n').replace(/\n$/, '');
-
-        return '\n\n' + fence + language + '\n' + cleanCode + '\n' + fence + '\n\n';
-    }
-});
-
-turndownService.addRule('customHeading', {
-    filter: ['h1', 'h2'],
-    replacement: (content, node) => {
-        const level = node.tagName === 'H1' ? 1 : 2;
-        return '#'.repeat(level) + ' ' + content + '\n\n';
-    }
-});
-
-turndownService.addRule('customHr', {
-    filter: 'hr',
-    replacement: () => '\n---\n'
-});
-
-/**
- * Restores unescaped LaTeX math formulas after Turndown processing.
- * Turndown automatically escapes backslashes (\ -> \\), underscores (_ -> \_),
- * brackets ([ -> \[, ] -> \]), asterisks, etc.
- * This helper restores clean mathematical expressions for both block ($$...$$)
- * and inline ($...$) formulas.
- */
-function unescapeMath(markdown) {
-    if (!markdown || typeof markdown !== 'string') return markdown;
-
-    const placeholders = [];
-    const makeToken = (idx) => `@@@MD_CODE_${idx}_${Date.now()}@@@`;
-
-    // Protect fenced code blocks: ```...``` or ~~~...~~~
-    let protectedMd = markdown.replace(/(```[\s\S]*?```|~~~[\s\S]*?~~~)/g, (match) => {
-        const token = makeToken(placeholders.length);
-        placeholders.push({ token, content: match });
-        return token;
-    });
-
-    // Protect inline code blocks: `...`
-    protectedMd = protectedMd.replace(/(`[^`\n]+?`)/g, (match) => {
-        const token = makeToken(placeholders.length);
-        placeholders.push({ token, content: match });
-        return token;
-    });
-
-    const restoreTex = (math) => {
-        return math
-            .replace(/\\\\\\\\/g, '\\\\')
-            .replace(/\\\\([a-zA-Z{}[\]()_#+\-.!*^])/g, '\\$1')
-            .replace(/\\_/g, '_')
-            .replace(/\\\*/g, '*')
-            .replace(/\\\[/g, '[')
-            .replace(/\\\]/g, ']')
-            .replace(/\\\(/g, '(')
-            .replace(/\\\)/g, ')')
-            .replace(/\\~/g, '~')
-            .replace(/\\`/g, '`')
-            .replace(/\\</g, '<')
-            .replace(/\\>/g, '>');
-    };
-
-    // 1. Block math: $$ ... $$
-    let result = protectedMd.replace(/\$\$([\s\S]+?)\$\$/g, (match, math) => `$$${restoreTex(math)}$$`);
-
-    // 2. Inline math: $ ... $ (no whitespace at boundaries, single line)
-    result = result.replace(/\$(?!\s)([^\$\n]+?)(?<!\s)\$/g, (match, math) => `$${restoreTex(math)}$`);
-
-    // Restore protected code blocks in reverse order
-    for (let i = placeholders.length - 1; i >= 0; i--) {
-        const { token, content } = placeholders[i];
-        result = result.replace(token, () => content);
-    }
-
-    return result;
-}
-
-// ---------------------------------------------------------
-// AUTHENTICATION & DIRECTORY HELPERS
-// ---------------------------------------------------------
-
-function loadUsers() {
-    try {
-        if (!fs.existsSync(USERS_FILE)) {
-            fs.ensureDirSync(path.dirname(USERS_FILE));
-            fs.writeJsonSync(USERS_FILE, {});
-        }
-        return fs.readJsonSync(USERS_FILE);
-    } catch (e) {
-        console.error('Error loading users:', e);
-        return {};
-    }
-}
-
-function saveUsers(users) {
-    fs.ensureDirSync(path.dirname(USERS_FILE));
-    fs.writeJsonSync(USERS_FILE, users, { spaces: 2 });
-}
-
-function getUserMdDir(username) {
-    if (!username) throw new Error('Username required');
-    const safeUser = username.replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase();
-    const userDir = path.join(__dirname, 'user_data', safeUser, 'md');
-    fs.ensureDirSync(userDir);
-    return userDir;
-}
-
-function getUserImagesDir(username) {
-    if (!username) throw new Error('Username required');
-    const safeUser = username.replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase();
-    const userImagesDir = path.join(__dirname, 'user_data', safeUser, 'images');
-    fs.ensureDirSync(userImagesDir);
-    return userImagesDir;
-}
-
-function authenticate(req, res, next) {
-    // 1. Check httpOnly cookie
-    let token = req.cookies?.token;
-    
-    // 2. Fallback to Authorization header
-    if (!token && req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
-        token = req.headers.authorization.slice(7).trim();
-    }
-
-    if (!token) {
-        return res.status(401).json({ success: false, message: 'Authentication required. Please log in.' });
-    }
-
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        req.user = decoded;
-        next();
-    } catch (err) {
-        return res.status(401).json({ success: false, message: 'Invalid or expired session. Please log in.' });
-    }
-}
-
-// Helpers
-function generateId(text) {
-    const alphabeticChars = text.match(/[A-Za-z]/g) || [];
-    const firstFour = alphabeticChars.slice(0, 4).join('');
-    const lastFour = alphabeticChars.slice(-4).join('');
-    return (firstFour + lastFour + text.length).toLowerCase();
-}
-
-function getDirectoryTree(dir, basePath = '') {
-    const result = [];
-    if (!fs.existsSync(dir)) return result;
-    const items = fs.readdirSync(dir);
-    
-    items.forEach(item => {
-        const fullPath = path.join(dir, item);
-        const relativePath = basePath ? `${basePath}/${item}` : item;
-        const stat = fs.statSync(fullPath);
-        
-        if (stat.isDirectory()) {
-            result.push({
-                name: item,
-                type: 'directory',
-                path: relativePath,
-                children: getDirectoryTree(fullPath, relativePath)
-            });
-        } else if (item.endsWith('.md')) { // Explicitly ignore .meta.json files
-            let fileTitle = item.replace('.md', '')
-                .split('-')
-                .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-                .join(' ');
-            
-            const metaPath = `${fullPath}.meta.json`;
-            // Resilient synchronous read that never throws on 0-byte or concurrently updated meta files
-            const metaData = readJsonSafelySync(metaPath, {});
-            if (metaData._pageMeta && metaData._pageMeta.title) {
-                fileTitle = metaData._pageMeta.title;
-            }
-
-            result.push({ 
-                name: item,
-                title: fileTitle,
-                type: 'file', 
-                path: relativePath 
-            });
-        }
-    });
-    
-    return result;
-}
-
-function getDirectories(dir, basePath = '') {
-    let dirs = [];
-    if (!fs.existsSync(dir)) return dirs;
-    const items = fs.readdirSync(dir);
-    
-    items.forEach(item => {
-        const fullPath = path.join(dir, item);
-        const relativePath = basePath ? `${basePath}/${item}` : item;
-        if (fs.statSync(fullPath).isDirectory()) {
-            dirs.push(relativePath);
-            dirs = dirs.concat(getDirectories(fullPath, relativePath));
-        }
-    });
-    return dirs;
-}
-
 // ---------------------------------------------------------
 // AUTH ROUTES
 // ---------------------------------------------------------
@@ -407,7 +169,7 @@ app.post('/api/auth/register', async (req, res) => {
             return res.status(409).json({ success: false, message: 'Username is already taken.' });
         }
 
-        const passwordHash = await bcrypt.hash(password, 10);
+        const passwordHash = await hashPassword(password);
         users[trimmedUser] = {
             username: trimmedUser,
             passwordHash,
@@ -428,13 +190,8 @@ app.post('/api/auth/register', async (req, res) => {
             );
         }
 
-        const token = jwt.sign({ username: trimmedUser }, JWT_SECRET, { expiresIn: '7d' });
-        res.cookie('token', token, {
-            httpOnly: true,
-            secure: process.env.NODE_ENV === 'production',
-            sameSite: 'lax',
-            maxAge: 7 * 24 * 60 * 60 * 1000
-        });
+        const token = issueToken(trimmedUser);
+        setAuthCookie(res, token);
 
         res.json({
             success: true,
@@ -459,19 +216,14 @@ app.post('/api/auth/login', async (req, res) => {
         const users = loadUsers();
         const user = users[trimmedUser];
 
-        if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+        if (!user || !(await comparePassword(password, user.passwordHash))) {
             return res.status(401).json({ success: false, message: 'Invalid username or password.' });
         }
 
         getUserMdDir(trimmedUser);
 
-        const token = jwt.sign({ username: trimmedUser }, JWT_SECRET, { expiresIn: '7d' });
-        res.cookie('token', token, {
-            httpOnly: true,
-            secure: process.env.NODE_ENV === 'production',
-            sameSite: 'lax',
-            maxAge: 7 * 24 * 60 * 60 * 1000
-        });
+        const token = issueToken(trimmedUser);
+        setAuthCookie(res, token);
 
         res.json({
             success: true,
@@ -486,10 +238,7 @@ app.post('/api/auth/login', async (req, res) => {
 
 // POST /api/auth/logout
 app.post('/api/auth/logout', (req, res) => {
-    res.clearCookie('token', {
-        httpOnly: true,
-        sameSite: 'lax'
-    });
+    clearAuthCookie(res);
     res.json({ success: true, message: 'Logged out successfully' });
 });
 
@@ -518,12 +267,12 @@ app.post('/api/auth/change-password', authenticate, async (req, res) => {
             return res.status(404).json({ success: false, message: 'User not found.' });
         }
 
-        const isMatch = await bcrypt.compare(currentPassword, user.passwordHash);
+        const isMatch = await comparePassword(currentPassword, user.passwordHash);
         if (!isMatch) {
             return res.status(401).json({ success: false, message: 'Current password is incorrect.' });
         }
 
-        user.passwordHash = await bcrypt.hash(newPassword, 10);
+        user.passwordHash = await hashPassword(newPassword);
         user.updatedAt = new Date().toISOString();
         users[username] = user;
         saveUsers(users);
@@ -659,30 +408,7 @@ app.get(/^\/api\/md\/(.*)$/, authenticate, async (req, res) => {
         }
 
         const rawMarkdown = fs.readFileSync(absolutePath, 'utf8');
-        const fullHtml = md.render(rawMarkdown);
-        const $ = cheerio.load(fullHtml);
-        
-        const sections = [];
-        let currentSectionHtml = '';
-        
-        // Split by <hr> tags
-        $('body').contents().each((i, el) => {
-            const isHr = el.tagName === 'hr' || el.name === 'hr' || (el.type === 'tag' && el.name === 'hr');
-            if (isHr) {
-                if (currentSectionHtml.trim()) {
-                    const textContent = cheerio.load(currentSectionHtml).text();
-                    sections.push({ id: generateId(textContent), html: currentSectionHtml });
-                    currentSectionHtml = '';
-                }
-            } else {
-                currentSectionHtml += $.html(el);
-            }
-        });
-        
-        if (currentSectionHtml.trim()) {
-            const textContent = cheerio.load(currentSectionHtml).text();
-            sections.push({ id: generateId(textContent), html: currentSectionHtml });
-        }
+        const sections = parseSections(rawMarkdown);
 
         // Fetch Metadata safely using atomic resilient helper (handles corrupted/mid-write files)
         const metaPath = `${absolutePath}.meta.json`;
@@ -700,45 +426,8 @@ app.get(/^\/api\/md\/(.*)$/, authenticate, async (req, res) => {
             chat: metaData[sec.id]?.chat || metaData[sec.id]?.chatHistory || metaData[sec.id]?.messages || []
         }));
 
-        // Track file view timestamp and log activity
         const nowIso = new Date().toISOString();
-        if (!metaData._pageMeta) metaData._pageMeta = {};
-
-        // Throttle disk writes for lastViewedAt: only write to disk if > 15s since last recorded view or title missing.
-        // This avoids hammering disk I/O on rapid re-renders or AI tool invocations.
-        const lastViewedMs = metaData._pageMeta.lastViewedAt ? new Date(metaData._pageMeta.lastViewedAt).getTime() : 0;
-        const shouldWriteMeta = !metaData._pageMeta.lastViewedAt || (Date.now() - lastViewedMs > 15000) || !metaData._pageMeta.title;
-
-        metaData._pageMeta.lastViewedAt = nowIso;
-        if (!metaData._pageMeta.title) metaData._pageMeta.title = pageTitle;
-
-        if (shouldWriteMeta) {
-            try {
-                // Re-read existing metadata file to ensure we merge lastViewedAt without dropping section keys
-                const existing = await readJsonSafelyAsync(metaPath, null);
-                // Fail-safe: if file exists on disk but failed to read, do NOT overwrite it
-                if (existing === null && fs.existsSync(metaPath)) {
-                    // Skip to protect existing data on disk
-                } else {
-                    const toPersist = existing || metaData;
-                    if (!toPersist._pageMeta) toPersist._pageMeta = {};
-                    toPersist._pageMeta.lastViewedAt = nowIso;
-                    if (!toPersist._pageMeta.title) {
-                        toPersist._pageMeta.title = (metaData._pageMeta && metaData._pageMeta.title) || pageTitle;
-                    }
-                    if (existing?._pageMeta?.lastTrackedAt && !toPersist._pageMeta.lastTrackedAt) {
-                        toPersist._pageMeta.lastTrackedAt = existing._pageMeta.lastTrackedAt;
-                    }
-                    if (existing?._pageMeta?.checkCounter !== undefined && toPersist._pageMeta.checkCounter === undefined) {
-                        toPersist._pageMeta.checkCounter = existing._pageMeta.checkCounter;
-                    }
-                    // Write atomically via temporary file and rename to prevent 0-byte truncation race conditions
-                    await writeJsonAtomic(metaPath, toPersist);
-                }
-            } catch (err) {
-                console.error(`Failed to update lastViewedAt for ${absolutePath}:`, err);
-            }
-        }
+        await recordFileView(metaPath, metaData, pageTitle, nowIso);
 
         // Log view activity and trigger background recommendation recalculation
         logActivity(req.user.username, {
@@ -772,8 +461,7 @@ app.post('/api/md/update', authenticate, async (req, res) => {
     }
 
     try {
-        let markdownText = turndownService.turndown(htmlContent);
-        markdownText = unescapeMath(markdownText);
+        const markdownText = htmlToMarkdown(htmlContent);
         await fs.ensureDir(path.dirname(absolutePath));
         await fs.writeFile(absolutePath, markdownText, 'utf8');
         
@@ -901,7 +589,7 @@ app.get('/api/file-tree', authenticate, (req, res) => {
 // POST /api/md/meta -> Update Metadata (Checkboxes, Counters, Title, Section Chat)
 app.post('/api/md/meta', authenticate, async (req, res) => {
     try {
-        const { filePath, sectionId, done, count, chat, chatHistory, messages, pageTitle } = req.body;
+        const { filePath } = req.body;
         const userMd = getUserMdDir(req.user.username);
         const absolutePath = path.resolve(path.join(userMd, filePath));
 
@@ -910,47 +598,16 @@ app.post('/api/md/meta', authenticate, async (req, res) => {
         }
 
         const metaPath = `${absolutePath}.meta.json`;
-        // Asynchronously read existing metadata with corrupted trailing byte recovery
-        let meta = await readJsonSafelyAsync(metaPath, {});
-
-        if (pageTitle !== undefined) {
-            if (!meta._pageMeta) meta._pageMeta = {};
-            meta._pageMeta.title = pageTitle;
-        }
-
         const nowIso = new Date().toISOString();
-        let eventType = null;
-
-        if (sectionId) {
-            if (!meta[sectionId]) meta[sectionId] = { done: false, count: 0 };
-            if (done !== undefined) {
-                meta[sectionId].done = done;
-                eventType = done ? 'track_section' : 'untrack_section';
-            }
-            if (count !== undefined) {
-                meta[sectionId].count = count;
-                if (!eventType) eventType = 'increment_counter';
-            }
-            const incomingChat = chat !== undefined ? chat : (chatHistory !== undefined ? chatHistory : messages);
-            if (incomingChat !== undefined) {
-                meta[sectionId].chat = incomingChat;
-            }
-            meta[sectionId].lastTrackedAt = nowIso;
-
-            if (!meta._pageMeta) meta._pageMeta = {};
-            meta._pageMeta.lastTrackedAt = nowIso;
-        }
-
-        // Serialize write through fileWriteQueues and POSIX atomic rename
-        await writeJsonAtomic(metaPath, meta);
+        const { meta, eventType } = await updateSectionMetadata(metaPath, req.body, nowIso);
 
         if (eventType) {
             logActivity(req.user.username, {
                 fileId: filePath,
-                sectionId,
+                sectionId: req.body.sectionId,
                 eventType,
                 timestamp: nowIso,
-                metadata: { done, count }
+                metadata: { done: req.body.done, count: req.body.count }
             }).catch(err => console.error('Failed to log section activity:', err));
 
             enqueueRecalculation(req.user.username);
@@ -1015,31 +672,8 @@ app.post('/api/recommendations/check', authenticate, async (req, res) => {
         }
 
         const metaPath = `${absolutePath}.meta.json`;
-        // Safely load metadata without throwing if file is being updated concurrently
-        let meta = await readJsonSafelyAsync(metaPath, {});
-
         const nowIso = new Date().toISOString();
-        if (!meta._pageMeta) meta._pageMeta = {};
-        meta._pageMeta.checkCounter = (meta._pageMeta.checkCounter || 0) + 1;
-        meta._pageMeta.lastTrackedAt = nowIso;
-
-        let targetSectionId = sectionId || null;
-        if (targetSectionId && meta[targetSectionId]) {
-            meta[targetSectionId].count = (meta[targetSectionId].count || 0) + 1;
-            meta[targetSectionId].lastTrackedAt = nowIso;
-        } else {
-            // If sectionId not specified, update count and lastTrackedAt on all tracked sections
-            for (const key of Object.keys(meta)) {
-                if (key !== '_pageMeta' && meta[key] && meta[key].done) {
-                    meta[key].count = (meta[key].count || 0) + 1;
-                    meta[key].lastTrackedAt = nowIso;
-                    if (!targetSectionId) targetSectionId = key;
-                }
-            }
-        }
-
-        // Persist atomically to prevent truncation or interleaving writes
-        await writeJsonAtomic(metaPath, meta);
+        const { meta, targetSectionId, checkCounter } = await recordRevisionCheck(metaPath, sectionId, nowIso);
 
         // Log revision check event
         await logActivity(req.user.username, {
@@ -1048,8 +682,8 @@ app.post('/api/recommendations/check', authenticate, async (req, res) => {
             eventType: 'revision_check',
             timestamp: nowIso,
             metadata: {
-                checkCounter: meta._pageMeta.checkCounter,
-                title: meta._pageMeta.title
+                checkCounter,
+                title: meta._pageMeta?.title
             }
         });
 
@@ -1059,7 +693,7 @@ app.post('/api/recommendations/check', authenticate, async (req, res) => {
         res.json({
             success: true,
             message: 'Revision check recorded successfully',
-            checkCounter: meta._pageMeta.checkCounter,
+            checkCounter,
             lastTrackedAt: nowIso
         });
     } catch (error) {
@@ -1092,27 +726,7 @@ app.post('/api/upload-drawing', authenticate, async (req, res) => {
 app.post('/api/delete-images', authenticate, async (req, res) => {
     try {
         const { fileNames, urls } = req.body;
-        const targetFiles = new Set();
-
-        if (Array.isArray(fileNames)) {
-            fileNames.forEach(f => {
-                if (typeof f === 'string' && f.trim()) {
-                    targetFiles.add(path.basename(f.trim()));
-                }
-            });
-        }
-
-        if (Array.isArray(urls)) {
-            urls.forEach(u => {
-                if (typeof u === 'string' && u.trim()) {
-                    const clean = u.trim().split('?')[0].split('#')[0];
-                    const parts = clean.split('/');
-                    const fileName = parts[parts.length - 1];
-                    if (fileName) targetFiles.add(path.basename(fileName));
-                }
-            });
-        }
-
+        const targetFiles = extractImageFileNames(fileNames, urls);
         const userImagesDir = getUserImagesDir(req.user.username);
         const deleted = [];
 
@@ -1136,99 +750,7 @@ app.post('/api/delete-images', authenticate, async (req, res) => {
     }
 });
 
-// Helper: Resolve requested model to provider instance & configuration
-// Default model: GPT OSS 120B (Groq)
-function resolveAiModel(requestedModelId) {
-    let rawId = (requestedModelId || 'openai/gpt-oss-120b').trim();
-    let id = rawId.toLowerCase();
-
-    // Normalize variations of default GPT OSS 120B
-    if (id === 'gpt oss 120b' || id === 'gpt-oss-120b' || id === 'openai/gpt-oss-120b' || id === 'default') {
-        rawId = 'openai/gpt-oss-120b';
-        id = rawId.toLowerCase();
-    }
-
-    // 1. Groq models (Default: openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.8-27b)
-    if (id.startsWith('qwen') || id.includes('gpt-oss') || id.includes('gpt oss') || id.startsWith('groq/')) {
-        const apiKey = process.env.GROQ_API_KEY;
-        if (!apiKey) {
-            return {
-                error: 'Missing GROQ_API_KEY in backend .env',
-                provider: 'Groq'
-            };
-        }
-        const groq = createGroq({ apiKey });
-        return {
-            provider: 'Groq',
-            modelName: rawId,
-            model: groq(rawId)
-        };
-    }
-
-    // 2. Anthropic Claude models
-    if (id.startsWith('claude')) {
-        const apiKey = process.env.ANTHROPIC_API_KEY;
-        if (!apiKey) {
-            return {
-                error: 'Missing ANTHROPIC_API_KEY in backend .env',
-                provider: 'Anthropic Claude'
-            };
-        }
-        const anthropic = createAnthropic({ apiKey });
-        return {
-            provider: 'Anthropic Claude',
-            modelName: rawId,
-            model: anthropic(rawId)
-        };
-    }
-
-    // 3. OpenAI models
-    if (id.startsWith('gpt') || id.startsWith('o1') || id.startsWith('o3')) {
-        const apiKey = process.env.OPENAI_API_KEY;
-        if (!apiKey) {
-            return {
-                error: 'Missing OPENAI_API_KEY in backend .env',
-                provider: 'OpenAI'
-            };
-        }
-        const openai = createOpenAI({ apiKey });
-        return {
-            provider: 'OpenAI',
-            modelName: rawId,
-            model: openai(rawId)
-        };
-    }
-
-    // 4. Google Gemini models
-    const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY || process.env.GOOGLE_API_KEY;
-    if (!apiKey) {
-        return {
-            error: 'Missing GEMINI_API_KEY in backend .env',
-            provider: 'Google Gemini'
-        };
-    }
-
-    const google = createGoogleGenerativeAI({ apiKey });
-    let resolvedGoogleId = rawId;
-
-    if (id === 'gemini-3.8-flash' || id === 'gemini 3.8 flash' || id === 'gemini') {
-        resolvedGoogleId = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
-    }
-
-    return {
-        provider: 'Google Gemini',
-        modelName: resolvedGoogleId,
-        model: google(resolvedGoogleId)
-    };
-}
-
 // POST /api/ai/generate -> Extensible AI generation endpoint (Gemini, Claude, OpenAI, Groq)
-// Supports modes:
-// - mode === 'chat': Q&A discussion, returns strict plain text only (maxWords limit)
-// - mode === 'update' (default): Rich text section editing, returns clean valid HTML
-const MOCK_LOREM_IPSUM = `<h2>Generated Section</h2><p>Lorem ipsum dolor sit amet, <strong>consectetur adipiscing elit</strong>. Integer nec odio. Praesent libero. Sed cursus ante dapibus diam. Sed nisi. Nulla quis sem at nibh elementum imperdiet.</p><p>Duis sagittis ipsum. Praesent mauris. Fusce nec tellus sed augue semper porta. Mauris massa. Vestibulum lacinia arcu eget nulla.</p><ul><li>Class aptent taciti sociosqu ad litora torquent per conubia nostra.</li><li>Inceptos himenaeos curabitur sodales ligula in libero.</li></ul>`;
-const MOCK_CHAT_ANSWER = `Based on this section, the main focus is structured organization and key concepts. The content covers essential guidelines and examples to help understand the material effectively. Feel free to ask more specific questions about any part of this section.`;
-
 app.post('/api/ai/generate', authenticate, async (req, res) => {
     try {
         const { model, prompt, context, mode = 'update', maxWords = 100 } = req.body;
@@ -1237,117 +759,8 @@ app.post('/api/ai/generate', authenticate, async (req, res) => {
             return res.status(400).json({ success: false, message: 'Prompt is required' });
         }
 
-        const resolved = resolveAiModel(model);
-
-        // If provider API key is not configured, return mock content preview
-        if (resolved.error) {
-            console.log(`[AI] ${resolved.error}. Returning mock preview for ${model || 'default'} (mode: ${mode}).`);
-            await new Promise(resolve => setTimeout(resolve, mode === 'chat' ? 600 : 800));
-            const mockText = mode === 'chat' ? MOCK_CHAT_ANSWER : MOCK_LOREM_IPSUM;
-            return res.json({
-                success: true,
-                content: mockText,
-                text: mockText,
-                mocked: true,
-                message: `${resolved.error}. Returned preview content.`
-            });
-        }
-
-        console.log(`[AI] Generating text with ${resolved.provider} (${resolved.modelName}, mode: ${mode})...`);
-
-        let systemInstruction;
-        if (mode === 'chat') {
-            systemInstruction = `You are an AI assistant answering questions about a specific section of a document.
-Context from the document section:
-"""
-${context ? context : '(Empty section)'}
-"""
-
-User question:
-"""
-${prompt.trim()}
-"""
-
-Strict output rules:
-1. Provide a direct, helpful, and concise answer based on the section context.
-2. Return PLAIN TEXT ONLY. Never output any HTML tags (e.g. no <p>, <br>, <div>, <span>, <b>, <i>, <h1>-<h6>).
-3. Do NOT output markdown code fences (no \`\`\` or \`\`\`html).
-4. Strictly limit your answer to at most ${maxWords} words (aim for between 50 and ${maxWords} words). Do not exceed ${maxWords} words.`;
-        } else {
-            // mode === 'update' (default): Rich text editor HTML replacement
-            systemInstruction = `You are an expert content editor assistant inside a rich text editor.
-The user wants you to edit, rewrite, expand, or generate content for a section of their document.
-
-Current section content (HTML):
-${context ? context : '(Empty section)'}
-
-User instructions:
-${prompt.trim()}
-
-Strict output guidelines:
-1. Return ONLY the content formatted in clean, valid HTML suitable for rendering directly in a rich text editor (e.g. <p>, <h2>, <h3>, <ul>, <ol>, <li>, <strong>, <em>, <blockquote>, <table>, <tr>, <th>, <td>, <code>, <pre>).
-2. Do NOT wrap the output in markdown code blocks (\`\`\`html or \`\`\`). Output raw HTML directly.
-3. Preserve existing facts, style, and context unless the prompt requests changing or replacing them.
-4. Keep the HTML semantic without inline CSS styles, script tags, or wrapper divs.`;
-        }
-
-        const result = await generateText({
-            model: resolved.model,
-            prompt: systemInstruction
-        });
-
-        let rawText = (result.text || '').trim();
-
-        if (mode === 'chat') {
-            // 1. Strip markdown code fences if present
-            if (rawText.startsWith('```')) {
-                rawText = rawText.replace(/^```[a-z]*\s*\n?/, '').replace(/\n?```\s*$/, '').trim();
-            }
-
-            // 2. Strict guarantee: strip any HTML tags if AI generated them
-            let plainText = cheerio.load(rawText).text().trim();
-            if (!plainText) {
-                plainText = rawText.replace(/<[^>]+>/g, '').trim();
-            }
-
-            // 3. Word limit enforcement: cap at maxWords
-            const words = plainText.split(/\s+/).filter(Boolean);
-            let finalText = plainText;
-            if (words.length > maxWords) {
-                finalText = words.slice(0, maxWords).join(' ') + '...';
-            }
-
-            return res.json({
-                success: true,
-                text: finalText,
-                content: finalText,
-                wordCount: finalText.split(/\s+/).filter(Boolean).length,
-                mocked: false,
-                model: resolved.modelName,
-                provider: resolved.provider
-            });
-        }
-
-        // mode === 'update': Format as valid HTML
-        let outputHtml = rawText;
-        // Strip markdown code fences if model enclosed it in ```html ... ```
-        if (outputHtml.startsWith('```')) {
-            outputHtml = outputHtml.replace(/^```(?:html)?\s*\n?/, '').replace(/\n?```\s*$/, '').trim();
-        }
-
-        // If the result didn't contain HTML tags, wrap in <p>
-        if (!/<[a-z][\s\S]*>/i.test(outputHtml)) {
-            outputHtml = `<p>${outputHtml.replace(/\n\n+/g, '</p><p>').replace(/\n/g, '<br/>')}</p>`;
-        }
-
-        return res.json({
-            success: true,
-            content: outputHtml,
-            mocked: false,
-            model: resolved.modelName,
-            provider: resolved.provider
-        });
-
+        const responsePayload = await generateAiContent({ model, prompt, context, mode, maxWords });
+        return res.json(responsePayload);
     } catch (error) {
         console.error('[AI] Generation failed:', error);
         return res.status(500).json({
@@ -1371,6 +784,5 @@ module.exports = {
     USERS_FILE,
     getUserMdDir,
     getUserImagesDir,
-    unescapeMath,
-    isHeadingOnlySection
+    unescapeMath
 };

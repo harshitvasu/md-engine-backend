@@ -1,45 +1,10 @@
 const path = require('path');
 const fs = require('fs-extra');
-const MarkdownIt = require('markdown-it');
 const cheerio = require('cheerio');
 const { getActivityEventsFile } = require('./activityService');
 const { readJsonSafelyAsync } = require('./jsonAtomic');
-
-const md = new MarkdownIt({ html: true });
-
-function generateId(text) {
-    const alphabeticChars = text.match(/[A-Za-z]/g) || [];
-    const firstFour = alphabeticChars.slice(0, 4).join('');
-    const lastFour = alphabeticChars.slice(-4).join('');
-    return (firstFour + lastFour + text.length).toLowerCase();
-}
-
-function parseSections(rawMarkdown) {
-    const fullHtml = md.render(rawMarkdown || '');
-    const $ = cheerio.load(fullHtml);
-    const sections = [];
-    let currentSectionHtml = '';
-
-    $('body').contents().each((i, el) => {
-        const isHr = el.tagName === 'hr' || el.name === 'hr' || (el.type === 'tag' && el.name === 'hr');
-        if (isHr) {
-            if (currentSectionHtml.trim()) {
-                const textContent = cheerio.load(currentSectionHtml).text();
-                sections.push({ id: generateId(textContent), html: currentSectionHtml });
-                currentSectionHtml = '';
-            }
-        } else {
-            currentSectionHtml += $.html(el);
-        }
-    });
-
-    if (currentSectionHtml.trim()) {
-        const textContent = cheerio.load(currentSectionHtml).text();
-        sections.push({ id: generateId(textContent), html: currentSectionHtml });
-    }
-
-    return sections;
-}
+const { generateId, parseSections } = require('../helpers/markdownHelper');
+const { getUserMdDir } = require('../helpers/fileHelper');
 
 /**
  * Detects whether a section HTML qualifies as a single-heading-only section.
@@ -83,13 +48,7 @@ function isHeadingOnlySection(htmlString) {
     return remainingText.length === 0 && !hasRemainingMedia;
 }
 
-function getUserMdDir(username) {
-    if (!username) throw new Error('Username required');
-    const safeUser = username.replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase();
-    const userDir = path.join(__dirname, '..', 'user_data', safeUser, 'md');
-    fs.ensureDirSync(userDir);
-    return userDir;
-}
+
 
 function getRecommendationsFile(username) {
     const safeUser = username.replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase();

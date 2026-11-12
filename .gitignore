@@ -3,3 +3,6 @@ user_data/*
 .env
 .env.*
 !.env.example
+data/worker.pid
+data/queue/*
+.DS_Store

@@ -6,6 +6,7 @@ const { Readable } = require('stream');
 const { EventEmitter } = require('events');
 
 // Configure isolated test users file before loading server
+process.env.NODE_ENV = 'test';
 const TEST_USERS_FILE = path.join(__dirname, '..', 'user_data', 'test_legacy_users.json');
 process.env.USERS_FILE = TEST_USERS_FILE;
 

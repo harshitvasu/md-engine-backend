@@ -1,12 +1,18 @@
-const { generateAndPersistRecommendations } = require('./recommendationEngine');
 const path = require('path');
 const fs = require('fs-extra');
+const { generateAndPersistRecommendations } = require('./recommendationEngine');
+const {
+    QUEUE_DIR,
+    PID_FILE,
+    isWorkerRunning,
+    ensureWorkerRunning,
+    processPendingJobs
+} = require('./recommendationWorker');
 
 const userJobStates = new Map();
-let periodicTimer = null;
 
 /**
- * Get or initialize job state for a user.
+ * Get or initialize job state for in-process fallback execution.
  */
 function getUserState(username) {
     const safeUser = username.replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase();
@@ -21,6 +27,7 @@ function getUserState(username) {
 
 /**
  * Run recalculation asynchronously ensuring strictly serial execution per user.
+ * Used when the standalone worker process is not active (e.g. tests or fallback).
  */
 async function processUserQueue(safeUser) {
     const state = userJobStates.get(safeUser);
@@ -30,6 +37,11 @@ async function processUserQueue(safeUser) {
 
     try {
         await generateAndPersistRecommendations(safeUser);
+        // Clean up corresponding queue job file if still present
+        const jobPath = path.join(QUEUE_DIR, `${safeUser}.job`);
+        if (await fs.pathExists(jobPath)) {
+            await fs.remove(jobPath).catch(() => {});
+        }
     } catch (err) {
         console.error(`[BackgroundQueue] Recommendation recalculation error for ${safeUser}:`, err);
     } finally {
@@ -46,17 +58,37 @@ async function processUserQueue(safeUser) {
 /**
  * Enqueue a background recalculation job for a user.
  * Non-blocking: returns immediately.
+ * Writes a .job file into data/queue for the standalone worker service.
+ * If the worker service is running, it picks up the job.
+ * If the worker is not active, executes via in-process async queue fallback.
  */
 function enqueueRecalculation(username) {
     if (!username) return;
-    const { state, safeUser } = getUserState(username);
+    const safeUser = username.replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase();
 
+    // 1. Write persistent job file for the background worker
+    try {
+        fs.ensureDirSync(QUEUE_DIR);
+        const jobPath = path.join(QUEUE_DIR, `${safeUser}.job`);
+        fs.writeJsonSync(jobPath, {
+            username: safeUser,
+            enqueuedAt: new Date().toISOString()
+        });
+    } catch (err) {
+        console.error(`[BackgroundQueue] Failed to write queue job for ${safeUser}:`, err);
+    }
+
+    // 2. If the standalone background worker is running, it will consume the job file
+    if (isWorkerRunning()) {
+        return;
+    }
+
+    // 3. Fallback: Process via in-process queue if worker is not actively running
+    const { state } = getUserState(username);
     if (state.isRunning) {
         state.pendingRerun = true;
         return;
     }
-
-    // Run asynchronously outside the request-response lifecycle
     setImmediate(() => {
         processUserQueue(safeUser);
     });
@@ -72,36 +104,14 @@ async function executeRecalculationNow(username) {
 }
 
 /**
- * Start periodic recalculation fallback for all active users.
+ * Legacy compatibility stub: Periodic sweeps are now handled by the standalone worker (worker.js).
  */
-function startPeriodicRecalculation(intervalMs = 30 * 60 * 1000) {
-    if (periodicTimer) return;
-
-    periodicTimer = setInterval(async () => {
-        try {
-            const usersFile = path.join(__dirname, '..', 'data', 'users.json');
-            if (await fs.pathExists(usersFile)) {
-                const users = await fs.readJson(usersFile);
-                const usernames = Object.keys(users);
-                for (const u of usernames) {
-                    enqueueRecalculation(u);
-                }
-            }
-        } catch (e) {
-            console.error('[BackgroundQueue] Periodic recalculation failed:', e);
-        }
-    }, intervalMs);
-
-    if (periodicTimer.unref) {
-        periodicTimer.unref(); // Don't prevent Node process from exiting
-    }
+function startPeriodicRecalculation() {
+    ensureWorkerRunning();
 }
 
 function stopPeriodicRecalculation() {
-    if (periodicTimer) {
-        clearInterval(periodicTimer);
-        periodicTimer = null;
-    }
+    // Worker manages its own timers
 }
 
 module.exports = {
@@ -109,5 +119,11 @@ module.exports = {
     executeRecalculationNow,
     startPeriodicRecalculation,
     stopPeriodicRecalculation,
-    userJobStates
+    isWorkerRunning,
+    ensureWorkerRunning,
+    processUserQueue,
+    processPendingJobs,
+    userJobStates,
+    QUEUE_DIR,
+    PID_FILE
 };
