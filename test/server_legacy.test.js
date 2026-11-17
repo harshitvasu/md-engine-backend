@@ -432,6 +432,52 @@ describe('Legacy Backend Core Suite (server.js)', () => {
             assert.equal(res.data.success, false);
             assert.match(res.data.message, /already exists/i);
         });
+
+        it('POST /api/upload-page -> uploads an existing markdown file and sets title from H1', async () => {
+            const fileContent = '# Custom Uploaded Guide\n\nThis is content of uploaded page.';
+            const res = await makeRequest(app, {
+                method: 'POST',
+                url: '/api/upload-page',
+                headers: authHeader,
+                body: { fileName: 'custom-guide.md', projectLocation: 'docs', fileContent }
+            });
+
+            assert.equal(res.status, 200);
+            assert.equal(res.data.success, true);
+            assert.equal(res.data.filePath, 'docs/custom-guide.md');
+
+            const userMd = getUserMdDir(TEST_USER);
+            const uploadedFile = path.join(userMd, 'docs', 'custom-guide.md');
+            const metaFile = `${uploadedFile}.meta.json`;
+
+            assert.ok(await fs.pathExists(uploadedFile));
+            assert.ok(await fs.pathExists(metaFile));
+
+            const contentOnDisk = await fs.readFile(uploadedFile, 'utf8');
+            assert.equal(contentOnDisk, fileContent);
+
+            const meta = await fs.readJson(metaFile);
+            assert.equal(meta._pageMeta.title, 'Custom Uploaded Guide');
+            assert.equal(meta._pageMeta.checkCounter, 0);
+        });
+
+        it('POST /api/upload-page -> rejects invalid filename or traversal or missing content', async () => {
+            const res1 = await makeRequest(app, {
+                method: 'POST',
+                url: '/api/upload-page',
+                headers: authHeader,
+                body: { fileName: 'invalid file!@#', projectLocation: '/', fileContent: 'hello' }
+            });
+            assert.equal(res1.status, 400);
+
+            const res2 = await makeRequest(app, {
+                method: 'POST',
+                url: '/api/upload-page',
+                headers: authHeader,
+                body: { fileName: 'test', projectLocation: '../../outside', fileContent: 'hello' }
+            });
+            assert.equal(res2.status, 403);
+        });
     });
 
     // =========================================================================

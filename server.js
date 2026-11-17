@@ -387,6 +387,89 @@ app.post('/api/create-page', authenticate, async (req, res) => {
     }
 });
 
+// POST: Upload an existing markdown (.md) file
+app.post('/api/upload-page', authenticate, async (req, res) => {
+    try {
+        const { fileName, projectLocation, fileContent } = req.body;
+
+        if (!fileName || projectLocation === undefined || projectLocation === null || fileContent === undefined || fileContent === null) {
+            return res.status(400).json({ success: false, message: 'File name, content, or project location is missing.' });
+        }
+
+        // Clean up fileName: remove trailing .md if provided by user/client, then validate
+        const cleanFileName = fileName.replace(/\.md$/i, '');
+
+        if (!/^[a-zA-Z0-9\-]+$/.test(cleanFileName)) {
+            return res.status(400).json({ success: false, message: 'Invalid file name. Use only letters, numbers, and "-".' });
+        }
+
+        const userMd = getUserMdDir(req.user.username);
+        const normalizedLocation = (projectLocation.trim() === '/' || projectLocation.trim() === '') 
+            ? '' 
+            : projectLocation.trim().replace(/^\/+/, '');
+        const fullDirPath = path.resolve(path.join(userMd, normalizedLocation));
+
+        // Security check: Must stay inside user directory
+        if (!fullDirPath.startsWith(userMd)) {
+            return res.status(403).json({ success: false, message: 'Invalid directory location.' });
+        }
+
+        await fs.promises.mkdir(fullDirPath, { recursive: true });
+        const filePath = path.join(fullDirPath, `${cleanFileName}.md`);
+
+        // Check if file exists
+        try {
+            await fs.promises.access(filePath);
+            return res.status(400).json({ success: false, message: 'File already exists.' });
+        } catch {
+            // File does not exist, proceed
+        }
+
+        await fs.promises.writeFile(filePath, fileContent, 'utf8');
+
+        const relativeFilePath = path.relative(userMd, filePath).replace(/\\/g, '/');
+        const nowIso = new Date().toISOString();
+
+        // Extract title: from first markdown H1 heading if present, or humanize filename
+        let pageTitle = cleanFileName.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+        const firstH1Match = fileContent.match(/^#\s+(.+)$/m);
+        if (firstH1Match && firstH1Match[1].trim()) {
+            pageTitle = firstH1Match[1].trim();
+        }
+
+        // Initialize companion metadata (.meta.json) with page metadata
+        const metaPath = `${filePath}.meta.json`;
+        const initialMeta = {
+            _pageMeta: {
+                title: pageTitle,
+                createdAt: nowIso,
+                lastViewedAt: nowIso,
+                checkCounter: 0
+            }
+        };
+        try {
+            await writeJsonAtomic(metaPath, initialMeta);
+        } catch (err) {
+            console.error('Failed to create initial meta file for uploaded page:', err);
+        }
+
+        // Log file creation event to recent activity stream
+        logActivity(req.user.username, {
+            fileId: relativeFilePath,
+            eventType: 'create_file',
+            timestamp: nowIso,
+            metadata: { title: pageTitle, fileName: cleanFileName, location: normalizedLocation, isUploaded: true }
+        }).catch(err => console.error('Failed to log upload activity:', err));
+
+        // Enqueue background recalculation for spaced-repetition recommendations
+        enqueueRecalculation(req.user.username);
+
+        res.json({ success: true, filePath: relativeFilePath });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
 // GET /api/md/* -> Fetch specific Markdown file with metadata
 app.get(/^\/api\/md\/(.*)$/, authenticate, async (req, res) => {
     try {
